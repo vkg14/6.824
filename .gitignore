@@ -1,4 +1,7 @@
 pkg/
 api.key
 .api.key.trimmed
+go.mod
 *-handin.tar.gz
+.idea
+src/main/mr-out*
