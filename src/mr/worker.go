@@ -39,7 +39,7 @@ func Worker(mapf func(string, string) []KeyValue,
 	breakLoop := false
 	for !breakLoop {
 		reply := CallAssignTask()
-		fmt.Printf("Assigned task %v for %v stage.\n", reply.TaskNumber, reply.Type)
+		fmt.Printf("Worker assigned task %v for stage %v.\n", reply.TaskNumber, reply.Type)
 		switch reply.Type {
 		case Map:
 			outputFiles := ApplyMap(mapf, reply.InputFiles[0], reply.NReduce, reply.TaskNumber)
@@ -142,35 +142,9 @@ func ApplyReduce(reducef func(string, []string) string, files []string, taskNumb
 	// Rename to correct format and close file
 	oname := fmt.Sprintf("mr-out-%v", taskNumber)
 	os.Rename(ofile.Name(), oname)
+	fmt.Printf("Renamed file to %v\n", oname)
 
 	return oname
-}
-
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
-	}
 }
 
 func CallAssignTask() AssignTaskReply {
@@ -179,6 +153,8 @@ func CallAssignTask() AssignTaskReply {
 	ok := call("Coordinator.AssignTask", &args, &reply)
 	if !ok {
 		fmt.Printf("call failed!\n")
+		// Exit assuming that coordinator can't be contacted
+		reply.Type = Exit
 	}
 	// Should return by ref?
 	return reply

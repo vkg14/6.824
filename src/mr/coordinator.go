@@ -11,92 +11,16 @@ import "os"
 import "net/rpc"
 import "net/http"
 
-type TaskState uint8
-
-const (
-	Idle TaskState = iota
-	Running
-	Completed
-)
-
-type TaskInfo struct {
-	taskNumber  int
-	state       TaskState
-	outputFiles []string
-}
-
-func (t *TaskInfo) IsComplete() bool {
-	return t.state == Completed
-}
-
-func (t *TaskInfo) IsIdle() bool {
-	return t.state == Idle
-}
-
-func (t *TaskInfo) IsRunning() bool {
-	return t.state == Running
-}
-
-func (t *TaskInfo) SetState(state TaskState) {
-	t.state = state
-}
-
-type ConcurrentTaskInfo struct {
-	m        sync.Mutex
-	tasks    []*TaskInfo
-	complete bool
-}
-
-func (c *ConcurrentTaskInfo) AssignIdleTask() *TaskInfo {
-	c.m.Lock()
-	// ensure to unlock after
-	defer c.m.Unlock()
-	for _, t := range c.tasks {
-		if !t.IsIdle() {
-			continue
-		}
-		t.SetState(Running)
-		return t
-	}
-	return nil
-}
-
-func (c *ConcurrentTaskInfo) SetState(task int, state TaskState) {
-	c.m.Lock()
-	// ensure to unlock after
-	defer c.m.Unlock()
-	if task >= len(c.tasks) {
-		return
-	}
-	c.tasks[task].SetState(state)
-}
-
-func (c *ConcurrentTaskInfo) AllComplete() bool {
-	if c.complete {
-		// Can touch this without incurring dangerous race condition
-		return true
-	}
-	c.m.Lock()
-	// ensure to unlock after
-	defer c.m.Unlock()
-	for _, t := range c.tasks {
-		if !t.IsComplete() {
-			return false
-		}
-	}
-	c.complete = true
-	return true
-}
-
 type Coordinator struct {
-	nReduce            int
-	nMap               int
-	inputFiles         []string
+	// Constants that need not be locked (only read)
+	nReduce    int
+	nMap       int
+	inputFiles []string
+	// Channels which are thread-safe
 	availableTaskChan  chan int
 	completionChannels []chan int
-	// variables to be guarded by mutex
-	// Make this a RW mutex
-	m                 sync.Mutex
+	m                  sync.RWMutex
+	// Members to be guarded by mutex
 	stage             TaskType
 	numCompletedTasks int
 }
@@ -176,15 +100,23 @@ func (c *Coordinator) AssignTask(args *AssignTaskArgs, reply *AssignTaskReply) e
 	val, ok := <-c.availableTaskChan
 	if !ok {
 		// Channel closed so we must exit!
+		reply.TaskNumber = -1
 		reply.Type = Exit
 		return nil
 	}
 	// Need to check RW Mutex here for stage
+	c.m.RLock()
+	defer c.m.RUnlock()
 	reply.Type = c.stage
 	reply.TaskNumber = val
 	reply.InputFiles = c.GenerateInputFiles(reply.TaskNumber)
 	reply.NReduce = c.nReduce
-	fmt.Printf("Found task %v to assign with input files %v\n", reply.TaskNumber, reply.InputFiles)
+	fmt.Printf(
+		"Coordinator found task %v in stage %v to assign with input files %v\n",
+		reply.TaskNumber,
+		reply.Type,
+		reply.InputFiles,
+	)
 	// Track completion
 	go c.TrackTaskProgress(reply.Type, reply.TaskNumber)
 	return nil
@@ -214,11 +146,9 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	ret := false
-
-	// Your code here.
-
-	return ret
+	c.m.RLock()
+	defer c.m.RUnlock()
+	return c.stage == Exit
 }
 
 // create a Coordinator.
