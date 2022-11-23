@@ -68,13 +68,15 @@ func ApplyMap(mapf func(string, string) []KeyValue, filename string, nReduce int
 	kva := mapf(filename, string(content))
 	intermediate = append(intermediate, kva...)
 
-	// Write these to files based on hash of key
+	// Create temp files and json encoders
 	outputFiles := make([]*os.File, nReduce)
 	encoders := make([]*json.Encoder, nReduce)
 	for i := range outputFiles {
-		outputFiles[i], _ = os.CreateTemp("", "ex")
+		outputFiles[i], _ = os.CreateTemp("", "tmp")
 		encoders[i] = json.NewEncoder(outputFiles[i])
 	}
+
+	// Write these to files based on hash of key
 	for _, kv := range intermediate {
 		hashBucket := ihash(kv.Key) % nReduce
 		encoders[hashBucket].Encode(&kv)
