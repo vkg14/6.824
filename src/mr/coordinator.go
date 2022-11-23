@@ -61,10 +61,7 @@ func (c *Coordinator) StageReduceTasks() {
 	}
 }
 
-func (c *Coordinator) CheckStageChange() {
-	// Read atomic variables once
-	numCompletedTasks := int(c.numCompletedTasks)
-	taskType := TaskType(c.taskStage)
+func (c *Coordinator) CheckStageChange(taskType TaskType, numCompletedTasks int) {
 	switch taskType {
 	case Map:
 		if numCompletedTasks == c.nMap {
@@ -100,8 +97,12 @@ func (c *Coordinator) TrackTaskProgress(taskType TaskType, taskNumber int) {
 	select {
 	case <-c.completionChannels[c.TaskNumberOffset(taskType)+taskNumber]:
 		fmt.Printf("Task completion notified: %v \n", taskNumber)
-		atomic.AddUint32(&c.numCompletedTasks, 1)
-		go c.CheckStageChange()
+		completed := atomic.AddUint32(&c.numCompletedTasks, 1)
+		// Change stage based on fixed values seen here.
+		// Ex. If two separate threads, hit this code,
+		// CheckStageChange should be called with *different* values of completed.
+		// This way, only one can be responsible for state change.
+		go c.CheckStageChange(taskType, int(completed))
 	case <-time.After(10 * time.Second):
 		// Re-schedule task
 		fmt.Printf("Timeout. Re-scheduling task: %v, stage: %v\n", taskNumber, taskType)
@@ -158,8 +159,9 @@ func (c *Coordinator) server() {
 	go http.Serve(l, nil)
 }
 
-// main/mrcoordinator.go calls Done() periodically to find out
-// if the entire job has finished.
+// Done simply checks that the taskStage is Exit and returns.
+// This member is atomically mutated and once state has shifted
+// to Exit, we can always safely move on.
 func (c *Coordinator) Done() bool {
 	return TaskType(c.taskStage) == Exit
 }
