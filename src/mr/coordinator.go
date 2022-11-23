@@ -3,7 +3,7 @@ package mr
 import (
 	"fmt"
 	"log"
-	"sync"
+	"sync/atomic"
 	"time"
 )
 import "net"
@@ -12,17 +12,16 @@ import "net/rpc"
 import "net/http"
 
 type Coordinator struct {
-	// Constants that need not be locked (only read)
+	// Constants (only read)
 	nReduce    int
 	nMap       int
 	inputFiles []string
 	// Channels which are thread-safe
 	availableTaskChan  chan int
 	completionChannels []chan int
-	m                  sync.RWMutex
-	// Members to be guarded by mutex
-	stage             TaskType
-	numCompletedTasks int
+	// Members to be atomically incremented
+	taskStage         uint32
+	numCompletedTasks uint32
 }
 
 // Example RPC handler
@@ -31,9 +30,9 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	return nil
 }
 
-func (c *Coordinator) GenerateInputFiles(taskNumber int) []string {
+func (c *Coordinator) GenerateInputFiles(taskType TaskType, taskNumber int) []string {
 	var inputFiles []string
-	switch c.stage {
+	switch taskType {
 	case Map:
 		inputFiles = append(inputFiles, c.inputFiles[taskNumber])
 	case Reduce:
@@ -63,30 +62,45 @@ func (c *Coordinator) StageReduceTasks() {
 }
 
 func (c *Coordinator) CheckStageChange() {
-	c.m.Lock()
-	defer c.m.Unlock()
-	if c.stage == Map && c.numCompletedTasks == c.nMap {
-		fmt.Printf("Map stage complete. Reduce stage starting.\n")
-		c.stage = Reduce
-		go c.StageReduceTasks()
-	} else if c.stage == Reduce && c.numCompletedTasks == c.nMap+c.nReduce {
-		fmt.Printf("MapReduce has completed.\n")
-		c.stage = Exit
-		close(c.availableTaskChan)
+	// Read atomic variables once
+	numCompletedTasks := int(c.numCompletedTasks)
+	taskType := TaskType(c.taskStage)
+	switch taskType {
+	case Map:
+		if numCompletedTasks == c.nMap {
+			// Before the system stages reduce tasks, it is impossible for the system
+			// to mark more than nMap tasks as complete.  Therefore, we can only enter
+			// this block *once* when no TrackTaskProgress
+			// goroutines are pending. This increment will move taskStage from 0 -> 1
+			fmt.Printf("Map stage complete. Reduce stage starting.\n")
+			atomic.AddUint32(&c.taskStage, 1)
+			go c.StageReduceTasks()
+		}
+	case Reduce:
+		if numCompletedTasks == c.nMap+c.nReduce {
+			// After the system stages reduce tasks, it is impossible for the system
+			// to mark more than nMap+nReduce tasks as complete.
+			// Therefore, we can only enter this block *once* when
+			// no TrackTaskProgress goroutines are pending.
+			// This increment will move taskStage from 1 -> 2
+			fmt.Printf("MapReduce has completed.\n")
+			atomic.AddUint32(&c.taskStage, 1)
+			close(c.availableTaskChan)
+		}
+
 	}
 }
 
 func (c *Coordinator) TrackTaskProgress(taskType TaskType, taskNumber int) {
-	// This is the crux of our logic.  This method
-	// will increment total completed tasks if completed within the time limit.
-	// As long as this running for a particular task, no other worker will be
-	// assigned this task.
+	// This is the crux of our logic.
+	// The invariant here is that there is only one TrackTaskProgress(t, k) running
+	// for any pair (t,k) at a time.  The only thing that can spawn another goroutine
+	// for TrackTaskProgress(t,k) is when the current call times out, re-stages task
+	// and thus exits.
 	select {
 	case <-c.completionChannels[c.TaskNumberOffset(taskType)+taskNumber]:
 		fmt.Printf("Task completion notified: %v \n", taskNumber)
-		c.m.Lock()
-		defer c.m.Unlock()
-		c.numCompletedTasks++
+		atomic.AddUint32(&c.numCompletedTasks, 1)
 		go c.CheckStageChange()
 	case <-time.After(10 * time.Second):
 		// Re-schedule task
@@ -104,12 +118,13 @@ func (c *Coordinator) AssignTask(args *AssignTaskArgs, reply *AssignTaskReply) e
 		reply.Type = Exit
 		return nil
 	}
-	// Need to check RW Mutex here for stage
-	c.m.RLock()
-	defer c.m.RUnlock()
-	reply.Type = c.stage
+	// Read atomic variable once
+	taskType := TaskType(c.taskStage)
+
+	// Assign reply fields
+	reply.Type = taskType
 	reply.TaskNumber = val
-	reply.InputFiles = c.GenerateInputFiles(reply.TaskNumber)
+	reply.InputFiles = c.GenerateInputFiles(reply.Type, reply.TaskNumber)
 	reply.NReduce = c.nReduce
 	fmt.Printf(
 		"Coordinator found task %v in stage %v to assign with input files %v\n",
@@ -146,9 +161,7 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	c.m.RLock()
-	defer c.m.RUnlock()
-	return c.stage == Exit
+	return TaskType(c.taskStage) == Exit
 }
 
 // create a Coordinator.
@@ -174,7 +187,6 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		inputFiles:         files,
 		availableTaskChan:  availableTaskChannel,
 		completionChannels: completionChannels,
-		stage:              Map,
 	}
 
 	c.server()
