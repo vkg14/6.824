@@ -4,4 +4,4 @@ api.key
 go.mod
 *-handin.tar.gz
 .idea
-src/main/mr-out*
+src/main/mr-*
