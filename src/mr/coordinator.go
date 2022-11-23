@@ -19,7 +19,7 @@ type Coordinator struct {
 	// Channels which are thread-safe
 	availableTaskChan  chan int
 	completionChannels []chan int
-	// Members to be atomically incremented
+	// Members to be atomically loaded and incremented
 	taskStage         uint32
 	numCompletedTasks uint32
 }
@@ -119,8 +119,7 @@ func (c *Coordinator) AssignTask(args *AssignTaskArgs, reply *AssignTaskReply) e
 		reply.Type = Exit
 		return nil
 	}
-	// Read atomic variable once
-	taskType := TaskType(c.taskStage)
+	taskType := TaskType(atomic.LoadUint32(&c.taskStage))
 
 	// Assign reply fields
 	reply.Type = taskType
@@ -163,12 +162,10 @@ func (c *Coordinator) server() {
 // This member is atomically mutated and once state has shifted
 // to Exit, we can always safely move on.
 func (c *Coordinator) Done() bool {
-	return TaskType(c.taskStage) == Exit
+	return TaskType(atomic.LoadUint32(&c.taskStage)) == Exit
 }
 
-// create a Coordinator.
-// main/mrcoordinator.go calls this function.
-// nReduce is the number of reduce tasks to use.
+// MakeCoordinator creates a coordinator and starts the HTTP server
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	nMap := len(files)
 	// Initialize channels
