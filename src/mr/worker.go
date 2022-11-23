@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 )
 import "log"
 import "net/rpc"
@@ -35,17 +36,26 @@ func ihash(key string) int {
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-	reply := CallAssignTask()
-	fmt.Printf("Assigned task %v\n", reply.TaskNumber)
-	ApplyMap(mapf, reply.InputFiles[0], reply.NReduce, reply.TaskNumber)
+	breakLoop := false
+	for !breakLoop {
+		reply := CallAssignTask()
+		fmt.Printf("Assigned task %v for %v stage.\n", reply.TaskNumber, reply.Type)
+		switch reply.Type {
+		case Map:
+			outputFiles := ApplyMap(mapf, reply.InputFiles[0], reply.NReduce, reply.TaskNumber)
+			CallMarkComplete(reply.Type, reply.TaskNumber, outputFiles)
+		case Reduce:
+			outputFile := ApplyReduce(reducef, reply.InputFiles, reply.TaskNumber)
+			CallMarkComplete(reply.Type, reply.TaskNumber, []string{outputFile})
+		default:
+			fmt.Printf("Breaking worker loop...\n")
+			breakLoop = true
+		}
+	}
 }
 
-func ApplyMap(mapf func(string, string) []KeyValue, filename string, nReduce int, taskNumber int) []KeyValue {
-	intermediate := []KeyValue{}
+func ApplyMap(mapf func(string, string) []KeyValue, filename string, nReduce int, taskNumber int) []string {
+	var intermediate []KeyValue
 	file, err := os.Open(filename)
 	if err != nil {
 		log.Fatalf("cannot open %v", filename)
@@ -71,13 +81,69 @@ func ApplyMap(mapf func(string, string) []KeyValue, filename string, nReduce int
 	}
 
 	// Rename files
+	var result []string
 	for i := range outputFiles {
-		os.Rename(outputFiles[i].Name(), fmt.Sprintf("mr-%v-%v", taskNumber, i))
-		fmt.Printf("Renamed file to %v\n", outputFiles[i].Name())
-		outputFiles[i].Close()
+		newName := fmt.Sprintf("mr-%v-%v", taskNumber, i)
+		os.Rename(outputFiles[i].Name(), newName)
+		result = append(result, newName)
+		fmt.Printf("Renamed file to %v\n", newName)
+		outputFiles[i].Close() // Clean up open files
 	}
 
-	return intermediate
+	return result
+}
+
+func ApplyReduce(reducef func(string, []string) string, files []string, taskNumber int) string {
+	// Read in key-values
+	var kva []KeyValue
+	for _, filename := range files {
+		file, err := os.Open(filename)
+		if err != nil {
+			fmt.Printf("Error while reading file %v\n", filename)
+			// Should likely kill execution of this worker here and let coordinator reschedule
+			continue
+		}
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kva = append(kva, kv)
+		}
+	}
+
+	// Sort by key so keys are grouped together
+	sort.Sort(ByKey(kva))
+
+	// Create temporary file while reducing, buffering and writing elements
+	ofile, _ := os.CreateTemp("", fmt.Sprintf("task-%v-temp", taskNumber))
+	defer ofile.Close()
+
+	// Loop over sorted keys, aggregating matching keys and reducing them
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := reducef(kva[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+
+		i = j
+	}
+
+	// Rename to correct format and close file
+	oname := fmt.Sprintf("mr-out-%v", taskNumber)
+	os.Rename(ofile.Name(), oname)
+
+	return oname
 }
 
 // example function to show how to make an RPC call to the coordinator.
@@ -116,6 +182,18 @@ func CallAssignTask() AssignTaskReply {
 	}
 	// Should return by ref?
 	return reply
+}
+
+func CallMarkComplete(taskType TaskType, number int, outputFiles []string) MarkCompleteReply {
+	args := MarkCompleteArgs{Type: taskType, TaskNumber: number, OutputFiles: outputFiles}
+	reply := MarkCompleteReply{}
+	ok := call("Coordinator.MarkComplete", &args, &reply)
+	if !ok {
+		fmt.Printf("call failed!\n")
+	}
+	// Should return by ref?
+	return reply
+
 }
 
 // send an RPC request to the coordinator, wait for the response.
