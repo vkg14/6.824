@@ -24,12 +24,6 @@ type Coordinator struct {
 	numCompletedTasks uint32
 }
 
-// Example RPC handler
-func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
-	return nil
-}
-
 func (c *Coordinator) GenerateInputFiles(taskType TaskType, taskNumber int) []string {
 	var inputFiles []string
 	switch taskType {
