@@ -40,6 +40,15 @@ type AssignTaskReply struct {
 	NReduce    int
 }
 
+type MarkCompleteArgs struct {
+	Type        TaskType
+	TaskNumber  int
+	OutputFiles []string
+}
+
+type MarkCompleteReply struct {
+}
+
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
 // Can't use the current directory since
