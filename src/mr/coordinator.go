@@ -96,7 +96,11 @@ func (c *Coordinator) waitForTaskResult(taskType TaskType, taskNumber int, assig
 		select {
 		case workerId := <-c.getTaskChannel(taskType, taskNumber):
 			if workerId != assignedWorker {
-				continue
+				fmt.Printf(
+					"Received a different worker %v instead of %v. Continue anyway (idempotent!)...\n",
+					workerId,
+					assignedWorker,
+				)
 			}
 			fmt.Printf("Task %v completion notified on worker %v\n", taskNumber, assignedWorker)
 			tasksLeft := atomic.AddInt32(&c.nTasksLeft, -1)
