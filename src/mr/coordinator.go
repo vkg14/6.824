@@ -65,7 +65,7 @@ func (c *Coordinator) CheckStageChange(taskType TaskType, numCompletedTasks int)
 			// goroutines are pending. This increment will move taskStage from 0 -> 1
 			fmt.Printf("Map stage complete. Reduce stage starting.\n")
 			atomic.AddUint32(&c.taskStage, 1)
-			go c.StageReduceTasks()
+			c.StageReduceTasks()
 		}
 	case Reduce:
 		if numCompletedTasks == c.nMap+c.nReduce {
@@ -96,7 +96,7 @@ func (c *Coordinator) TrackTaskProgress(taskType TaskType, taskNumber int) {
 		// Ex. If two separate threads, hit this code,
 		// CheckStageChange should be called with *different* values of completed.
 		// This way, only one can be responsible for state change.
-		go c.CheckStageChange(taskType, int(completed))
+		c.CheckStageChange(taskType, int(completed))
 	case <-time.After(10 * time.Second):
 		// Re-schedule task
 		fmt.Printf("Timeout. Re-scheduling task: %v, stage: %v\n", taskNumber, taskType)
