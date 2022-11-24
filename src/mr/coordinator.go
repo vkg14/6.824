@@ -14,17 +14,17 @@ import "net/http"
 type Coordinator struct {
 	// Constants (only read)
 	nReduce    int
-	nMap       int
 	inputFiles []string
 	// Channels which are thread-safe
-	availableTaskChan  chan int
-	completionChannels []chan int
-	// Members to be atomically loaded and incremented
-	taskStage         uint32
-	numCompletedTasks uint32
+	unscheduledTaskQueue chan int
+	mapTaskChannels      []chan int
+	reduceTaskChannels   []chan int
+	// Members to be atomically loaded and incremented/decremented
+	taskStage  int32
+	nTasksLeft int32
 }
 
-func (c *Coordinator) GenerateInputFiles(taskType TaskType, taskNumber int) []string {
+func (c *Coordinator) generateInputFiles(taskType TaskType, taskNumber int) []string {
 	var inputFiles []string
 	switch taskType {
 	case Map:
@@ -37,90 +37,96 @@ func (c *Coordinator) GenerateInputFiles(taskType TaskType, taskNumber int) []st
 	return inputFiles
 }
 
-func (c *Coordinator) TaskNumberOffset(taskType TaskType) int {
-	switch taskType {
-	case Map:
-		return 0
-	case Reduce:
-		return c.nMap
-	default:
-		// error?
-		return -1
-	}
-}
-
-func (c *Coordinator) StageReduceTasks() {
+func (c *Coordinator) enqueueReduceTasks() {
 	for i := 0; i < c.nReduce; i++ {
-		c.availableTaskChan <- i
+		c.unscheduledTaskQueue <- i
 	}
 }
 
-func (c *Coordinator) CheckStageChange(taskType TaskType, numCompletedTasks int) {
+func (c *Coordinator) adjustTaskStage(taskType TaskType, nTasksLeft int) {
 	switch taskType {
 	case Map:
-		if numCompletedTasks == c.nMap {
+		if nTasksLeft == c.nReduce {
 			// Before the system stages reduce tasks, it is impossible for the system
 			// to mark more than nMap tasks as complete.  Therefore, we can only enter
-			// this block *once* when no TrackTaskProgress
+			// this block *once* when no waitForTaskResult
 			// goroutines are pending. This increment will move taskStage from 0 -> 1
 			fmt.Printf("Map stage complete. Reduce stage starting.\n")
-			atomic.AddUint32(&c.taskStage, 1)
-			c.StageReduceTasks()
+			atomic.AddInt32(&c.taskStage, 1)
+			c.enqueueReduceTasks()
 		}
 	case Reduce:
-		if numCompletedTasks == c.nMap+c.nReduce {
+		if nTasksLeft == 0 {
 			// After the system stages reduce tasks, it is impossible for the system
 			// to mark more than nMap+nReduce tasks as complete.
 			// Therefore, we can only enter this block *once* when
-			// no TrackTaskProgress goroutines are pending.
+			// no waitForTaskResult goroutines are pending.
 			// This increment will move taskStage from 1 -> 2
 			fmt.Printf("MapReduce has completed.\n")
-			atomic.AddUint32(&c.taskStage, 1)
-			close(c.availableTaskChan)
+			atomic.AddInt32(&c.taskStage, 1)
+			close(c.unscheduledTaskQueue)
 		}
 
 	}
 }
 
-func (c *Coordinator) TrackTaskProgress(taskType TaskType, taskNumber int) {
-	// This is the crux of our logic.  The goroutine for TrackTaskProgress(t,k) will
-	// either increment the completed counter on completion OR reschedule the task
-	// on timeout.  If the latter happens, the counter does not get incremented until
-	// the task is reassigned to a worker by AssignTask RPC Handler and a new
-	// TrackTaskProgress(t,k) is run (with the current one having exited on timeout).
-	// This maintains the invariant that each completed task only increments the counter
-	// exactly once.
-	select {
-	case <-c.completionChannels[c.TaskNumberOffset(taskType)+taskNumber]:
-		fmt.Printf("Task completion notified: %v \n", taskNumber)
-		completed := atomic.AddUint32(&c.numCompletedTasks, 1)
-		// Change stage based on fixed values seen here.
-		// Ex. If two separate threads, hit this code,
-		// CheckStageChange should be called with *different* values of completed.
-		c.CheckStageChange(taskType, int(completed))
-	case <-time.After(10 * time.Second):
-		// Re-schedule task.  To keep our invariant, we can only increment our counter for this
-		// task *after* another worker has been assigned the rescheduled task.
-		fmt.Printf("Timeout. Re-scheduling task: %v, stage: %v\n", taskNumber, taskType)
-		c.availableTaskChan <- taskNumber
+func (c *Coordinator) getTaskChannel(taskType TaskType, taskNumber int) chan int {
+	switch taskType {
+	case Map:
+		return c.mapTaskChannels[taskNumber]
+	case Reduce:
+		return c.reduceTaskChannels[taskNumber]
+	default:
+		// Should never get here - maybe error or log?
+		return nil
 	}
 }
 
-// AssignTask RPC handler
-func (c *Coordinator) AssignTask(args *AssignTaskArgs, reply *AssignTaskReply) error {
-	val, ok := <-c.availableTaskChan
+func (c *Coordinator) waitForTaskResult(taskType TaskType, taskNumber int, assignedWorker int) {
+	// This is the crux of our logic.  The goroutine for waitForTaskResult(t,k) will
+	// either decrement the remaining counter on completion OR reschedule the task
+	// on timeout.  If the latter happens, the counter does not get decremented until
+	// the task is reassigned to a worker by RequestTask RPC Handler and a new
+	// waitForTaskResult(t,k) is run (with the current one having exited on timeout).
+	// This maintains the invariant that each completed task only decrements the counter
+	// exactly once.
+	timeout := time.After(10 * time.Second)
+	breakLoop := false
+	for !breakLoop {
+		select {
+		case workerId := <-c.getTaskChannel(taskType, taskNumber):
+			if workerId != assignedWorker {
+				continue
+			}
+			fmt.Printf("Task %v completion notified on worker %v\n", taskNumber, assignedWorker)
+			tasksLeft := atomic.AddInt32(&c.nTasksLeft, -1)
+			c.adjustTaskStage(taskType, int(tasksLeft))
+			breakLoop = true
+		case <-timeout:
+			// Re-schedule task.  To keep our invariant, we can only decrement our counter for this
+			// task *after* another worker has been assigned the rescheduled task.
+			fmt.Printf("Timeout. Re-scheduling task: %v, stage: %v\n", taskNumber, taskType)
+			c.unscheduledTaskQueue <- taskNumber
+			breakLoop = true
+		}
+	}
+}
+
+// RequestTask RPC handler
+func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) error {
+	val, ok := <-c.unscheduledTaskQueue
 	if !ok {
 		// Channel closed so we should tell worker to exit!
 		reply.TaskNumber = -1
 		reply.Type = Exit
 		return nil
 	}
-	taskType := TaskType(atomic.LoadUint32(&c.taskStage))
+	taskType := TaskType(atomic.LoadInt32(&c.taskStage))
 
 	// Assign reply fields
 	reply.Type = taskType
 	reply.TaskNumber = val
-	reply.InputFiles = c.GenerateInputFiles(reply.Type, reply.TaskNumber)
+	reply.InputFiles = c.generateInputFiles(reply.Type, reply.TaskNumber)
 	reply.NReduce = c.nReduce
 	fmt.Printf(
 		"Coordinator found task %v in stage %v to assign with input files %v\n",
@@ -129,17 +135,16 @@ func (c *Coordinator) AssignTask(args *AssignTaskArgs, reply *AssignTaskReply) e
 		reply.InputFiles,
 	)
 	// Track completion
-	go c.TrackTaskProgress(reply.Type, reply.TaskNumber)
+	go c.waitForTaskResult(reply.Type, reply.TaskNumber, args.WorkerId)
 	return nil
 }
 
-func (c *Coordinator) MarkComplete(args *MarkCompleteArgs, reply *MarkCompleteReply) error {
-	channelIndex := c.TaskNumberOffset(args.Type) + args.TaskNumber
-	// The value sent below is received by goroutine TrackTaskProgress(type, taskNumber) and
+func (c *Coordinator) ReportTaskComplete(args *ReportTaskCompleteArgs, reply *ReportTaskCompleteReply) error {
+	// The value sent below is received by goroutine waitForTaskResult(type, taskNumber) and
 	// will mark the task as completed if the goroutine has not timed out (and thus
 	// scheduled a back-up).
 	fmt.Printf("Marking task %v for stage %v as completed\n", args.TaskNumber, args.Type)
-	c.completionChannels[channelIndex] <- 1
+	c.getTaskChannel(args.Type, args.TaskNumber) <- args.WorkerId
 	return nil
 }
 
@@ -161,30 +166,36 @@ func (c *Coordinator) server() {
 // This member is atomically mutated and once state has shifted
 // to Exit, we can always safely move on.
 func (c *Coordinator) Done() bool {
-	return TaskType(atomic.LoadUint32(&c.taskStage)) == Exit
+	return TaskType(atomic.LoadInt32(&c.taskStage)) == Exit
 }
 
 // MakeCoordinator creates a coordinator and starts the HTTP server
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	nMap := len(files)
-	// Initialize channels
-	availableTaskChannel := make(chan int, nMap)
-	completionChannels := make([]chan int, nMap+nReduce)
+	// Initialize unscheduled task queue with enough buffer for all tasks.
+	unscheduledTaskQueue := make(chan int, nMap+nReduce)
+
+	mapTaskChannels := make([]chan int, nMap)
 	for i := 0; i < nMap; i++ {
 		// Push all *map* tasks as available initially
-		availableTaskChannel <- i
+		unscheduledTaskQueue <- i
 		// Make buffer 2 to handle potential backups
-		completionChannels[i] = make(chan int, 2)
+		mapTaskChannels[i] = make(chan int, 2)
 	}
+
+	reduceTaskChannels := make([]chan int, nReduce)
 	for i := 0; i < nReduce; i++ {
-		completionChannels[nMap+i] = make(chan int, 2)
+		// Make buffer 2 to handle potential backups
+		reduceTaskChannels[i] = make(chan int, 2)
 	}
 	c := Coordinator{
-		nReduce:            nReduce,
-		nMap:               nMap,
-		inputFiles:         files,
-		availableTaskChan:  availableTaskChannel,
-		completionChannels: completionChannels,
+		nReduce:              nReduce,
+		inputFiles:           files,
+		unscheduledTaskQueue: unscheduledTaskQueue,
+		mapTaskChannels:      mapTaskChannels,
+		reduceTaskChannels:   reduceTaskChannels,
+		taskStage:            int32(0),
+		nTasksLeft:           int32(nMap + nReduce),
 	}
 
 	c.server()

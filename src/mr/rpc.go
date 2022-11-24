@@ -30,23 +30,24 @@ const (
 	Exit
 )
 
-type AssignTaskArgs struct {
+type RequestTaskArgs struct {
+	WorkerId int
 }
 
-type AssignTaskReply struct {
+type RequestTaskReply struct {
 	Type       TaskType
 	TaskNumber int
 	InputFiles []string
 	NReduce    int
 }
 
-type MarkCompleteArgs struct {
-	Type        TaskType
-	TaskNumber  int
-	OutputFiles []string
+type ReportTaskCompleteArgs struct {
+	Type       TaskType
+	TaskNumber int
+	WorkerId   int
 }
 
-type MarkCompleteReply struct {
+type ReportTaskCompleteReply struct {
 }
 
 // Cook up a unique-ish UNIX-domain socket name
