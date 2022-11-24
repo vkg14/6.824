@@ -83,11 +83,13 @@ func (c *Coordinator) CheckStageChange(taskType TaskType, numCompletedTasks int)
 }
 
 func (c *Coordinator) TrackTaskProgress(taskType TaskType, taskNumber int) {
-	// This is the crux of our logic.
-	// The invariant here is that there is only one TrackTaskProgress(t, k) running
-	// for any pair (t,k) at a time.  The only thing that can spawn another goroutine
-	// for TrackTaskProgress(t,k) is when the current call times out, re-stages task
-	// and thus exits.
+	// This is the crux of our logic.  The goroutine for TrackTaskProgress(t,k) will
+	// either increment the completed counter on completion OR reschedule the task
+	// on timeout.  If the latter happens, the counter does not get incremented until
+	// the task is reassigned to a worker by AssignTask RPC Handler and a new
+	// TrackTaskProgress(t,k) is run (with the current one having exited on timeout).
+	// This maintains the invariant that each completed task only increments the counter
+	// exactly once.
 	select {
 	case <-c.completionChannels[c.TaskNumberOffset(taskType)+taskNumber]:
 		fmt.Printf("Task completion notified: %v \n", taskNumber)
@@ -95,10 +97,10 @@ func (c *Coordinator) TrackTaskProgress(taskType TaskType, taskNumber int) {
 		// Change stage based on fixed values seen here.
 		// Ex. If two separate threads, hit this code,
 		// CheckStageChange should be called with *different* values of completed.
-		// This way, only one can be responsible for state change.
 		c.CheckStageChange(taskType, int(completed))
 	case <-time.After(10 * time.Second):
-		// Re-schedule task
+		// Re-schedule task.  To keep our invariant, we can only increment our counter for this
+		// task *after* another worker has been assigned the rescheduled task.
 		fmt.Printf("Timeout. Re-scheduling task: %v, stage: %v\n", taskNumber, taskType)
 		c.availableTaskChan <- taskNumber
 	}
@@ -108,7 +110,7 @@ func (c *Coordinator) TrackTaskProgress(taskType TaskType, taskNumber int) {
 func (c *Coordinator) AssignTask(args *AssignTaskArgs, reply *AssignTaskReply) error {
 	val, ok := <-c.availableTaskChan
 	if !ok {
-		// Channel closed so we must exit!
+		// Channel closed so we should tell worker to exit!
 		reply.TaskNumber = -1
 		reply.Type = Exit
 		return nil
@@ -133,8 +135,11 @@ func (c *Coordinator) AssignTask(args *AssignTaskArgs, reply *AssignTaskReply) e
 
 func (c *Coordinator) MarkComplete(args *MarkCompleteArgs, reply *MarkCompleteReply) error {
 	channelIndex := c.TaskNumberOffset(args.Type) + args.TaskNumber
-	c.completionChannels[channelIndex] <- 1
+	// The value sent below is received by goroutine TrackTaskProgress(type, taskNumber) and
+	// will mark the task as completed if the goroutine has not timed out (and thus
+	// scheduled a back-up).
 	fmt.Printf("Marking task %v for stage %v as completed\n", args.TaskNumber, args.Type)
+	c.completionChannels[channelIndex] <- 1
 	return nil
 }
 
