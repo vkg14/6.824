@@ -167,7 +167,7 @@ func (c *Coordinator) changeTaskStatus(taskType TaskType, taskNumber int, oldSta
 	case Reduce:
 		status = c.reduceTaskStatus
 	default:
-		fmt.Printf("Received unknown type %v in changeTaskStatus.\n", taskType)
+		fmt.Printf("Received unexpected type %v in changeTaskStatus.\n", taskType)
 		return false
 	}
 	return atomic.CompareAndSwapInt32(&status[taskNumber], int32(oldState), int32(newState))
