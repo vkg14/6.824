@@ -38,15 +38,15 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	breakLoop := false
 	for !breakLoop {
-		reply := CallAssignTask()
+		reply := CallRequestTask()
 		fmt.Printf("Worker assigned task %v for stage %v.\n", reply.TaskNumber, reply.Type)
 		switch reply.Type {
 		case Map:
-			outputFiles := ApplyMap(mapf, reply.InputFiles[0], reply.NReduce, reply.TaskNumber)
-			CallMarkComplete(reply.Type, reply.TaskNumber, outputFiles)
+			ApplyMap(mapf, reply.InputFiles[0], reply.NReduce, reply.TaskNumber)
+			CallReportTaskComplete(reply.Type, reply.TaskNumber)
 		case Reduce:
-			outputFile := ApplyReduce(reducef, reply.InputFiles, reply.TaskNumber)
-			CallMarkComplete(reply.Type, reply.TaskNumber, []string{outputFile})
+			ApplyReduce(reducef, reply.InputFiles, reply.TaskNumber)
+			CallReportTaskComplete(reply.Type, reply.TaskNumber)
 		default:
 			fmt.Printf("Breaking worker loop...\n")
 			breakLoop = true
@@ -119,8 +119,8 @@ func ApplyReduce(reducef func(string, []string) string, files []string, taskNumb
 	sort.Sort(ByKey(kva))
 
 	// Create temporary file while reducing, buffering and writing elements
-	ofile, _ := os.CreateTemp("", fmt.Sprintf("task-%v-temp", taskNumber))
-	defer ofile.Close()
+	outputFile, _ := os.CreateTemp("", fmt.Sprintf("task-%v-temp", taskNumber))
+	defer outputFile.Close()
 
 	// Loop over sorted keys, aggregating matching keys and reducing them
 	i := 0
@@ -129,43 +129,42 @@ func ApplyReduce(reducef func(string, []string) string, files []string, taskNumb
 		for j < len(kva) && kva[j].Key == kva[i].Key {
 			j++
 		}
-		values := []string{}
+		var values []string
 		for k := i; k < j; k++ {
 			values = append(values, kva[k].Value)
 		}
 		output := reducef(kva[i].Key, values)
 
-		// this is the correct format for each line of Reduce output.
-		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+		fmt.Fprintf(outputFile, "%v %v\n", kva[i].Key, output)
 
 		i = j
 	}
 
 	// Rename to correct format and close file
-	oname := fmt.Sprintf("mr-out-%v", taskNumber)
-	os.Rename(ofile.Name(), oname)
-	fmt.Printf("Renamed file to %v\n", oname)
+	outputName := fmt.Sprintf("mr-out-%v", taskNumber)
+	os.Rename(outputFile.Name(), outputName)
+	fmt.Printf("Renamed file to %v\n", outputName)
 
-	return oname
+	return outputName
 }
 
-func CallAssignTask() AssignTaskReply {
-	args := AssignTaskArgs{}
-	reply := AssignTaskReply{}
-	ok := call("Coordinator.AssignTask", &args, &reply)
+func CallRequestTask() *RequestTaskReply {
+	args := RequestTaskArgs{WorkerId: os.Getpid()}
+	reply := RequestTaskReply{}
+	ok := call("Coordinator.RequestTask", &args, &reply)
 	if !ok {
 		fmt.Printf("call failed!\n")
 		// Exit assuming that coordinator can't be contacted
 		reply.Type = Exit
 	}
 	// Should return by ref?
-	return reply
+	return &reply
 }
 
-func CallMarkComplete(taskType TaskType, number int, outputFiles []string) MarkCompleteReply {
-	args := MarkCompleteArgs{Type: taskType, TaskNumber: number, OutputFiles: outputFiles}
-	reply := MarkCompleteReply{}
-	ok := call("Coordinator.MarkComplete", &args, &reply)
+func CallReportTaskComplete(taskType TaskType, number int) ReportTaskCompleteReply {
+	args := ReportTaskCompleteArgs{Type: taskType, TaskNumber: number, WorkerId: os.Getpid()}
+	reply := ReportTaskCompleteReply{}
+	ok := call("Coordinator.ReportTaskComplete", &args, &reply)
 	if !ok {
 		fmt.Printf("call failed!\n")
 	}
