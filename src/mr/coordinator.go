@@ -33,13 +33,6 @@ type Coordinator struct {
 	nTasksLeft int32
 
 	/*
-		taskStage starts as 0 (Map) and will transition to 1 (Reduce) and 2 (Exit)
-		when the requisite number of tasks have been completed.  It is stored as
-		int32 to make atomic operations possible with the atomic lib.
-	*/
-	taskStage int32
-
-	/*
 		Status of tasks is stored in the int32 arrays below
 		Status is initialized at 0 (Unscheduled) and can be
 		atomically swapped to 1 (Running) and eventually to
@@ -75,30 +68,24 @@ func (c *Coordinator) enqueueReduceTasks() {
 	}
 }
 
-func (c *Coordinator) adjustTaskStage(taskType TaskType, nTasksLeft int) {
-	switch taskType {
-	case Map:
-		if nTasksLeft == c.nReduce {
-			// Before the system stages reduce tasks, it is impossible for the system
-			// to mark more than nMap tasks as complete.  Therefore, we can only enter
-			// this block *once* when no waitForTaskResult
-			// goroutines are pending. This increment will move taskStage from 0 -> 1
-			fmt.Printf("Map stage complete. Reduce stage starting.\n")
-			atomic.AddInt32(&c.taskStage, 1)
-			c.enqueueReduceTasks()
-		}
-	case Reduce:
-		if nTasksLeft == 0 {
-			// After the system stages reduce tasks, it is impossible for the system
-			// to mark more than nMap+nReduce tasks as complete.
-			// Therefore, we can only enter this block *once* when
-			// no waitForTaskResult goroutines are pending.
-			// This increment will move taskStage from 1 -> 2
-			fmt.Printf("MapReduce has completed.\n")
-			atomic.AddInt32(&c.taskStage, 1)
-			close(c.unscheduledTaskQueue)
-		}
+func (c *Coordinator) getStage() TaskType {
+	tasksLeft := atomic.LoadInt32(&c.nTasksLeft)
+	if int(tasksLeft) > c.nReduce {
+		return Map
+	} else if tasksLeft > 0 {
+		return Reduce
+	} else {
+		return Exit
+	}
+}
 
+func (c *Coordinator) adjustTaskStage(nTasksLeft int) {
+	if nTasksLeft == c.nReduce {
+		fmt.Printf("Map stage complete. Reduce stage starting.\n")
+		c.enqueueReduceTasks()
+	} else if nTasksLeft == 0 {
+		fmt.Printf("MapReduce has completed.\n")
+		close(c.unscheduledTaskQueue)
 	}
 }
 
@@ -134,7 +121,7 @@ func (c *Coordinator) waitForTaskChannels(taskType TaskType, taskNumber int, ass
 		}
 		fmt.Printf("Task %v completion notified on worker %v\n", taskNumber, assignedWorker)
 		tasksLeft := atomic.AddInt32(&c.nTasksLeft, -1)
-		c.adjustTaskStage(taskType, int(tasksLeft))
+		c.adjustTaskStage(int(tasksLeft))
 	case <-timeout:
 		// Re-schedule task.  To keep our invariant, we can only decrement our counter for this
 		// task *after* another worker has been assigned the rescheduled task.
@@ -182,7 +169,7 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 		reply.Type = Exit
 		return nil
 	}
-	taskType := TaskType(atomic.LoadInt32(&c.taskStage))
+	taskType := c.getStage()
 
 	// Assign reply fields
 	reply.Type = taskType
@@ -226,7 +213,7 @@ func (c *Coordinator) ReportTaskResult(args *ReportTaskResultArgs, reply *Report
 		if c.changeTaskStatus(args.Type, args.TaskNumber, Running, Done) {
 			fmt.Printf("Finished task %v for stage %v.\n", args.TaskNumber, args.Type)
 			tasksLeft := atomic.AddInt32(&c.nTasksLeft, -1)
-			c.adjustTaskStage(args.Type, int(tasksLeft))
+			c.adjustTaskStage(int(tasksLeft))
 		}
 	}
 	return nil
@@ -246,11 +233,11 @@ func (c *Coordinator) server() {
 	go http.Serve(l, nil)
 }
 
-// Done simply checks that the taskStage is Exit and returns.
+// Done simply checks that the stage is Exit and returns.
 // This member is atomically mutated and once state has shifted
 // to Exit, we can always safely move on.
 func (c *Coordinator) Done() bool {
-	return TaskType(atomic.LoadInt32(&c.taskStage)) == Exit
+	return c.getStage() == Exit
 }
 
 // MakeCoordinator creates a coordinator and starts the HTTP server
@@ -277,7 +264,6 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
 		nReduce:              nReduce,
 		inputFiles:           files,
-		taskStage:            int32(0),
 		nTasksLeft:           int32(nMap + nReduce),
 		unscheduledTaskQueue: unscheduledTaskQueue,
 		mapTaskStatus:        mapTaskStatus,
