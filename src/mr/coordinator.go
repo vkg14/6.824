@@ -11,17 +11,41 @@ import "os"
 import "net/rpc"
 import "net/http"
 
+type TaskStatus uint8
+
+const (
+	Unscheduled TaskStatus = iota
+	Running
+	Done
+)
+
+const UseAtomics = true
+
 type Coordinator struct {
-	// Constants (only read)
-	nReduce    int
-	inputFiles []string
-	// Channels which are thread-safe
-	unscheduledTaskQueue chan int
-	mapTaskChannels      []chan int
-	reduceTaskChannels   []chan int
-	// Members to be atomically loaded and incremented/decremented
-	taskStage  int32
+	nReduce              int
+	inputFiles           []string
+	unscheduledTaskQueue chan int // a channel "queue" with tasks ready for execution
+
+	// nTasksLeft starts as (nReduce+nMap) and will be decremented as tasks complete.
+	// It is stored as int32 to make atomic operations possible with the atomic lib.
 	nTasksLeft int32
+
+	// taskStage starts as 0 (Map) and will transition to 1 (Reduce) and 2 (Exit)
+	// when the requisite number of tasks have been completed.  It is stored as
+	// int32 to make atomic operations possible with the atomic lib.
+	taskStage int32
+
+	// Channels to communicate success from RPC handler to task-tracking goroutine
+	// These are used when UseAtomics = false
+	mapTaskChannels    []chan int
+	reduceTaskChannels []chan int
+
+	// Status of tasks is stored in the int32 arrays below
+	// Status is initialized at 0 (Unscheduled) and can be
+	// atomically swapped to 1 (Running) and eventually to
+	// 2 (Done).  These are used when UseAtomics = true
+	mapTaskStatus    []int32
+	reduceTaskStatus []int32
 }
 
 func (c *Coordinator) generateInputFiles(taskType TaskType, taskNumber int) []string {
@@ -82,7 +106,7 @@ func (c *Coordinator) getTaskChannel(taskType TaskType, taskNumber int) chan int
 	}
 }
 
-func (c *Coordinator) waitForTaskResult(taskType TaskType, taskNumber int, assignedWorker int) {
+func (c *Coordinator) waitForTaskChannels(taskType TaskType, taskNumber int, assignedWorker int) {
 	// This is the crux of our logic.  The goroutine for waitForTaskResult(t,k) will
 	// either decrement the remaining counter on completion OR reschedule the task
 	// on timeout.  If the latter happens, the counter does not get decremented until
@@ -91,29 +115,53 @@ func (c *Coordinator) waitForTaskResult(taskType TaskType, taskNumber int, assig
 	// This maintains the invariant that each completed task only decrements the counter
 	// exactly once.
 	timeout := time.After(10 * time.Second)
-	breakLoop := false
-	for !breakLoop {
-		select {
-		case workerId := <-c.getTaskChannel(taskType, taskNumber):
-			if workerId != assignedWorker {
-				fmt.Printf(
-					"Received a different worker %v instead of %v. Continue anyway (idempotent!)...\n",
-					workerId,
-					assignedWorker,
-				)
-			}
-			fmt.Printf("Task %v completion notified on worker %v\n", taskNumber, assignedWorker)
-			tasksLeft := atomic.AddInt32(&c.nTasksLeft, -1)
-			c.adjustTaskStage(taskType, int(tasksLeft))
-			breakLoop = true
-		case <-timeout:
-			// Re-schedule task.  To keep our invariant, we can only decrement our counter for this
-			// task *after* another worker has been assigned the rescheduled task.
-			fmt.Printf("Timeout. Re-scheduling task: %v, stage: %v\n", taskNumber, taskType)
-			c.unscheduledTaskQueue <- taskNumber
-			breakLoop = true
+	select {
+	case workerId := <-c.getTaskChannel(taskType, taskNumber):
+		if workerId != assignedWorker {
+			fmt.Printf(
+				"Received a different worker %v instead of %v. Continue anyway (idempotent!)...\n",
+				workerId,
+				assignedWorker,
+			)
 		}
+		fmt.Printf("Task %v completion notified on worker %v\n", taskNumber, assignedWorker)
+		tasksLeft := atomic.AddInt32(&c.nTasksLeft, -1)
+		c.adjustTaskStage(taskType, int(tasksLeft))
+	case <-timeout:
+		// Re-schedule task.  To keep our invariant, we can only decrement our counter for this
+		// task *after* another worker has been assigned the rescheduled task.
+		fmt.Printf("Timeout. Re-scheduling task: %v, stage: %v\n", taskNumber, taskType)
+		c.unscheduledTaskQueue <- taskNumber
 	}
+}
+
+func (c *Coordinator) waitForTaskAtomics(taskType TaskType, taskNumber int) {
+	<-time.After(10 * time.Second)
+	// What can happen here:
+	// Changed status from Running to Unsched: task timed out; reschedule
+	// Failed status change: task has been already marked done.
+	if c.changeTaskStatus(taskType, taskNumber, Running, Unscheduled) {
+		c.unscheduledTaskQueue <- taskNumber
+	}
+}
+
+func (c *Coordinator) changeTaskStatus(taskType TaskType, taskNumber int, oldState TaskStatus, newState TaskStatus) bool {
+	// Valid state transitions are 0->1 (via RequestTask), 1->2 (via ReportTaskResult), and 1->0 (via waitForTaskResult)
+	if oldState == Done || (oldState == Unscheduled && newState == Done) {
+		fmt.Printf("Invalid state change attempted from %v to %v.\n", oldState, newState)
+		return false
+	}
+	var status []int32
+	switch taskType {
+	case Map:
+		status = c.mapTaskStatus
+	case Reduce:
+		status = c.reduceTaskStatus
+	default:
+		fmt.Printf("Received unknown type %v in changeTaskStatus.\n", taskType)
+		return false
+	}
+	return atomic.CompareAndSwapInt32(&status[taskNumber], int32(oldState), int32(newState))
 }
 
 // RequestTask RPC handler
@@ -138,17 +186,40 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 		reply.Type,
 		reply.InputFiles,
 	)
-	// Track completion
-	go c.waitForTaskResult(reply.Type, reply.TaskNumber, args.WorkerId)
+	// Track completion with a go-routine
+	if !UseAtomics {
+		go c.waitForTaskChannels(reply.Type, reply.TaskNumber, args.WorkerId)
+	} else {
+		// We atomically change the status and then track timeouts only
+		if c.changeTaskStatus(reply.Type, reply.TaskNumber, Unscheduled, Running) {
+			go c.waitForTaskAtomics(reply.Type, reply.TaskNumber)
+		} else {
+			fmt.Printf("Invariant broken. Failed state change in RequestTask.")
+		}
+	}
 	return nil
 }
 
-func (c *Coordinator) ReportTaskComplete(args *ReportTaskCompleteArgs, reply *ReportTaskCompleteReply) error {
-	// The value sent below is received by goroutine waitForTaskResult(type, taskNumber) and
-	// will mark the task as completed if the goroutine has not timed out (and thus
-	// scheduled a back-up).
-	fmt.Printf("Marking task %v for stage %v as completed\n", args.TaskNumber, args.Type)
-	c.getTaskChannel(args.Type, args.TaskNumber) <- args.WorkerId
+func (c *Coordinator) ReportTaskResult(args *ReportTaskResultArgs, reply *ReportTaskResultReply) error {
+	if !UseAtomics {
+		// The value sent below is received by goroutine waitForTaskResult(type, taskNumber) and
+		// will mark the task as completed if the goroutine has not timed out (and thus
+		// scheduled a back-up).
+		fmt.Printf("Marking task %v for stage %v as completed\n", args.TaskNumber, args.Type)
+		c.getTaskChannel(args.Type, args.TaskNumber) <- args.WorkerId
+	} else {
+		// What can happen here:
+		// Atomically transition from Running -> Done: this task is now complete.
+		// - adjust tasksLeft counter
+		// - modify stage of coordinator if necessary
+		// Failed atomic transition: this task has timed out via waitForTaskAtomics.
+		// - the task has been rescheduled, so we need not do anything.
+		if c.changeTaskStatus(args.Type, args.TaskNumber, Running, Done) {
+			fmt.Printf("Finished task %v for stage %v.\n", args.TaskNumber, args.Type)
+			tasksLeft := atomic.AddInt32(&c.nTasksLeft, -1)
+			c.adjustTaskStage(args.Type, int(tasksLeft))
+		}
+	}
 	return nil
 }
 
@@ -180,6 +251,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	unscheduledTaskQueue := make(chan int, nMap+nReduce)
 
 	mapTaskChannels := make([]chan int, nMap)
+	mapTaskStatus := make([]int32, nMap)
 	for i := 0; i < nMap; i++ {
 		// Push all *map* tasks as available initially
 		unscheduledTaskQueue <- i
@@ -188,6 +260,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	}
 
 	reduceTaskChannels := make([]chan int, nReduce)
+	reduceTaskStatus := make([]int32, nReduce)
 	for i := 0; i < nReduce; i++ {
 		// Make buffer 2 to handle potential backups
 		reduceTaskChannels[i] = make(chan int, 2)
@@ -198,6 +271,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		unscheduledTaskQueue: unscheduledTaskQueue,
 		mapTaskChannels:      mapTaskChannels,
 		reduceTaskChannels:   reduceTaskChannels,
+		mapTaskStatus:        mapTaskStatus,
+		reduceTaskStatus:     reduceTaskStatus,
 		taskStage:            int32(0),
 		nTasksLeft:           int32(nMap + nReduce),
 	}
