@@ -26,26 +26,34 @@ type Coordinator struct {
 	inputFiles           []string
 	unscheduledTaskQueue chan int // a channel "queue" with tasks ready for execution
 
-	// nTasksLeft starts as (nReduce+nMap) and will be decremented as tasks complete.
-	// It is stored as int32 to make atomic operations possible with the atomic lib.
+	/*
+		nTasksLeft starts as (nReduce+nMap) and will be decremented as tasks complete.
+		It is stored as int32 to make atomic operations possible with the atomic lib.
+	*/
 	nTasksLeft int32
 
-	// taskStage starts as 0 (Map) and will transition to 1 (Reduce) and 2 (Exit)
-	// when the requisite number of tasks have been completed.  It is stored as
-	// int32 to make atomic operations possible with the atomic lib.
+	/*
+		taskStage starts as 0 (Map) and will transition to 1 (Reduce) and 2 (Exit)
+		when the requisite number of tasks have been completed.  It is stored as
+		int32 to make atomic operations possible with the atomic lib.
+	*/
 	taskStage int32
 
-	// Channels to communicate success from RPC handler to task-tracking goroutine
-	// These are used when UseAtomics = false
-	mapTaskChannels    []chan int
-	reduceTaskChannels []chan int
-
-	// Status of tasks is stored in the int32 arrays below
-	// Status is initialized at 0 (Unscheduled) and can be
-	// atomically swapped to 1 (Running) and eventually to
-	// 2 (Done).  These are used when UseAtomics = true
+	/*
+		Status of tasks is stored in the int32 arrays below
+		Status is initialized at 0 (Unscheduled) and can be
+		atomically swapped to 1 (Running) and eventually to
+		2 (Done).  These are used when UseAtomics = true
+	*/
 	mapTaskStatus    []int32
 	reduceTaskStatus []int32
+
+	/*
+		Channels to communicate success from RPC handler to task-tracking goroutine
+		These are used when UseAtomics = false
+	*/
+	mapTaskChannels    []chan int
+	reduceTaskChannels []chan int
 }
 
 func (c *Coordinator) generateInputFiles(taskType TaskType, taskNumber int) []string {
@@ -141,6 +149,7 @@ func (c *Coordinator) waitForTaskAtomics(taskType TaskType, taskNumber int) {
 	// Changed status from Running to Unsched: task timed out; reschedule
 	// Failed status change: task has been already marked done.
 	if c.changeTaskStatus(taskType, taskNumber, Running, Unscheduled) {
+		fmt.Printf("Timeout. Re-scheduling task: %v, stage: %v\n", taskNumber, taskType)
 		c.unscheduledTaskQueue <- taskNumber
 	}
 }
@@ -268,13 +277,13 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
 		nReduce:              nReduce,
 		inputFiles:           files,
-		unscheduledTaskQueue: unscheduledTaskQueue,
-		mapTaskChannels:      mapTaskChannels,
-		reduceTaskChannels:   reduceTaskChannels,
-		mapTaskStatus:        mapTaskStatus,
-		reduceTaskStatus:     reduceTaskStatus,
 		taskStage:            int32(0),
 		nTasksLeft:           int32(nMap + nReduce),
+		unscheduledTaskQueue: unscheduledTaskQueue,
+		mapTaskStatus:        mapTaskStatus,
+		reduceTaskStatus:     reduceTaskStatus,
+		mapTaskChannels:      mapTaskChannels,
+		reduceTaskChannels:   reduceTaskChannels,
 	}
 
 	c.server()
