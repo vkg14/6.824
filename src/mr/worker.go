@@ -43,10 +43,10 @@ func Worker(mapf func(string, string) []KeyValue,
 		switch reply.Type {
 		case Map:
 			ApplyMap(mapf, reply.InputFiles[0], reply.NReduce, reply.TaskNumber)
-			CallReportTaskComplete(reply.Type, reply.TaskNumber)
+			CallReportTaskResult(reply.Type, reply.TaskNumber)
 		case Reduce:
 			ApplyReduce(reducef, reply.InputFiles, reply.TaskNumber)
-			CallReportTaskComplete(reply.Type, reply.TaskNumber)
+			CallReportTaskResult(reply.Type, reply.TaskNumber)
 		default:
 			fmt.Printf("Breaking worker loop...\n")
 			breakLoop = true
@@ -161,10 +161,10 @@ func CallRequestTask() *RequestTaskReply {
 	return &reply
 }
 
-func CallReportTaskComplete(taskType TaskType, number int) ReportTaskCompleteReply {
-	args := ReportTaskCompleteArgs{Type: taskType, TaskNumber: number, WorkerId: os.Getpid()}
-	reply := ReportTaskCompleteReply{}
-	ok := call("Coordinator.ReportTaskComplete", &args, &reply)
+func CallReportTaskResult(taskType TaskType, number int) ReportTaskResultReply {
+	args := ReportTaskResultArgs{Type: taskType, TaskNumber: number, WorkerId: os.Getpid()}
+	reply := ReportTaskResultReply{}
+	ok := call("Coordinator.ReportTaskResult", &args, &reply)
 	if !ok {
 		fmt.Printf("call failed!\n")
 	}
