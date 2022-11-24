@@ -10,9 +10,9 @@ echo "Setting up output directory: $(pwd)"
 
 # Build wc, coordinator, and worker
 echo "Building apps..."
-(cd ../../mrapps && go build $RACE -buildmode=plugin wc.go) || exit 1
-(cd .. && go build $RACE mrcoordinator.go) || exit 1
-(cd .. && go build $RACE mrworker.go) || exit 1
+(cd ../../mrapps && go build -buildmode=plugin wc.go) || exit 1
+(cd .. && go build mrcoordinator.go) || exit 1
+(cd .. && go build mrworker.go) || exit 1
 
 hyperfine -w 3 'timeout -k 2s 900s ../run-wc.sh' &
 pid=$!
