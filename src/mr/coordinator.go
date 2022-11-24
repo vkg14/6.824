@@ -203,7 +203,7 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 		if c.changeTaskStatus(reply.Type, reply.TaskNumber, Unscheduled, Running) {
 			go c.waitForTaskAtomics(reply.Type, reply.TaskNumber)
 		} else {
-			fmt.Printf("Invariant broken. Failed state change in RequestTask.")
+			log.Fatal("Invariant broken with failed state change in RequestTask. Exit...")
 		}
 	}
 	return nil
