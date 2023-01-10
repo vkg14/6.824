@@ -19,7 +19,10 @@ package raft
 
 import (
 	"fmt"
+	"io"
+	"log"
 	"math/rand"
+	"os"
 
 	//	"bytes"
 	"sync"
@@ -51,6 +54,9 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+// Notification - Empty struct for notification
+type Notification struct{}
+
 type State uint8
 
 const (
@@ -71,15 +77,14 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	// The following are channels used for event notifications
-	validHeartbeatCh       chan bool
-	validRequestVoteCh     chan bool
-	majorityAchievedCh     chan bool
-	demotionNotificationCh chan bool
-	killCh                 chan bool
+	// The following are (thread-safe) channels used for event notifications
+	validHeartbeatCh       chan Notification
+	validRequestVoteCh     chan Notification
+	majorityAchievedCh     chan Notification
+	demotionNotificationCh chan Notification
+	killCh                 chan Notification
 
 	// The following need to be locked by a mutex
-	// TODO: consider making a few of these atomic?
 	currentTerm int
 	state       State
 	votedFor    int
@@ -226,11 +231,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 // notifyEvent sends an event notification to a bool channel if any thread is waiting on that notification.
-func notifyEvent(eventCh chan bool, eventType string) {
+func notifyEvent(eventCh chan Notification, eventType string) {
 	// From: https://stackoverflow.com/questions/25657207/how-to-know-a-buffered-channel-is-full
 	select {
-	case eventCh <- true:
-		fmt.Printf("Notified a %v event!\n", eventType)
+	case eventCh <- Notification{}:
+		log.Printf("Notified a %v event!\n", eventType)
 	default:
 		// Do nothing; nothing was waiting on an event
 	}
@@ -247,7 +252,7 @@ func (rf *Raft) demoteToFollower(updatedTerm int) {
 	rf.currentTerm = updatedTerm
 	rf.votedFor = -1
 	rf.nVotes = 0
-	// Send this notification so that a server that believed it was leader/candidate can behave like a follower
+	// Send this notification to the main loop, which will refrain from any leader/candidate behavior once received.
 	notifyEvent(rf.demotionNotificationCh, fmt.Sprintf("(DemotionToFollower, %v)", rf.me))
 }
 
@@ -260,7 +265,7 @@ func (rf *Raft) startNewElection() {
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
 	rf.nVotes = 1 // important: vote for self
-	fmt.Printf("Server %v starting an election in term %v!\n", rf.me, rf.currentTerm)
+	log.Printf("Server %v starting an election in term %v!\n", rf.me, rf.currentTerm)
 	// Send Request Votes
 	args := RequestVoteArgs{
 		Term:      rf.currentTerm,
@@ -346,7 +351,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		// Majority achieved
 		rf.state = Leader
 		notifyEvent(rf.majorityAchievedCh, fmt.Sprintf("(MajorityAchieved, %v)", rf.me))
-		fmt.Printf("Server %v is now the leader in term %v.\n", rf.me, rf.currentTerm)
+		log.Printf("Server %v is now the leader in term %v.\n", rf.me, rf.currentTerm)
 	}
 }
 
@@ -392,7 +397,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // We notify the main loop (ticker) of the kill so it can exit.
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
 	notifyEvent(rf.killCh, fmt.Sprintf("(Kill, %v)", rf.me))
 }
 
@@ -422,7 +426,6 @@ func (rf *Raft) ticker() {
 			electionTimeout := time.After(getElectionTimeout() * time.Millisecond)
 			select {
 			case <-electionTimeout:
-				fmt.Printf("Election timeout - server %v starting an election!\n", rf.me)
 				rf.startNewElection()
 			case <-rf.validHeartbeatCh:
 				// reset timeout; ie, do nothing
@@ -437,7 +440,6 @@ func (rf *Raft) ticker() {
 			select {
 			case <-electionTimeout:
 				// Start another election
-				fmt.Printf("Election timeout - server %v starting an election!\n", rf.me)
 				rf.startNewElection()
 			case <-rf.majorityAchievedCh:
 				// Send heartbeats immediately here
@@ -459,11 +461,6 @@ func (rf *Raft) ticker() {
 				// do nothing, outer for loop will now exit
 			}
 		}
-
-		// Your code here to check if a leader election should
-		// be started and to randomize sleeping time using
-		// time.Sleep().
-		// Choose an election timeout and wait for it to run to completion.
 	}
 }
 
@@ -491,11 +488,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nVotes = 0
 
 	// Notification channels
-	rf.validHeartbeatCh = make(chan bool)
-	rf.validRequestVoteCh = make(chan bool)
-	rf.demotionNotificationCh = make(chan bool)
-	rf.majorityAchievedCh = make(chan bool)
-	rf.killCh = make(chan bool)
+	rf.validHeartbeatCh = make(chan Notification)
+	rf.validRequestVoteCh = make(chan Notification)
+	rf.demotionNotificationCh = make(chan Notification)
+	rf.majorityAchievedCh = make(chan Notification)
+	rf.killCh = make(chan Notification)
+
+	debug := false
+	if !debug {
+		log.SetOutput(io.Discard)
+	} else {
+		log.SetOutput(os.Stdout) // To debug
+	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
