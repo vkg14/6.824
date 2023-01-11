@@ -182,6 +182,8 @@ func notifyEvent(eventCh chan Notification, eventType string) {
 	}
 }
 
+// *** METHODS THAT ARE NOT THREAD-SAFE AND REQUIRE CALLER TO HAVE ACQUIRED LOCK ***
+
 // demoteToFollower - requires caller to have lock held
 func (rf *Raft) demoteToFollower(updatedTerm int) {
 	// General premise is that this Raft server is out of date.
@@ -197,15 +199,62 @@ func (rf *Raft) demoteToFollower(updatedTerm int) {
 	notifyEvent(rf.demotionNotificationCh, fmt.Sprintf("(DemotionToFollower, %v)", rf.me))
 }
 
+// lastLogIndex - assumes lock is held by caller
+func (rf *Raft) lastLogIndex() int {
+	return len(rf.log) - 1
+}
+
 // lastLogTerm - assumes lock is held by caller
 func (rf *Raft) lastLogTerm() int {
 	return rf.log[rf.lastLogIndex()].Term
 }
 
-// lastLogIndex - assumes lock is held by caller
-func (rf *Raft) lastLogIndex() int {
-	return len(rf.log) - 1
+// adjustFollowerCommit - requires lock to be held by caller
+func (rf *Raft) adjustFollowerCommit(leaderCommit, lastNewIndex int) {
+	if leaderCommit > rf.commitIndex {
+		rf.commitIndex = min(leaderCommit, lastNewIndex)
+		if rf.commitIndex > rf.lastApplied {
+			rf.applyToStateMachine()
+		}
+	}
 }
+
+// adjustLeaderCommit - caller needs to hold lock
+func (rf *Raft) adjustLeaderCommit() {
+	// Find max N such that majority of matchIndex[i] >= N and log[N].term == currentTerm
+	// We can rely on the fact that log[0].term = 0 to stop our loop (dummy LogEntry)
+	for i := rf.lastLogIndex(); rf.log[i].Term == rf.currentTerm; i-- {
+		nSatisfied := 0
+		for j := range rf.matchIndex {
+			if rf.matchIndex[j] >= i {
+				nSatisfied++
+			}
+		}
+		if nSatisfied > len(rf.peers)/2 {
+			// Majority consensus achieved for log @ commit index
+			rf.commitIndex = i
+			if rf.commitIndex > rf.lastApplied {
+				rf.applyToStateMachine()
+			}
+			break
+		}
+	}
+}
+
+// applyToStateMachine - ensures that any committed log command is only applied once via mutex guarding.
+// *** requires lock to be held by caller
+func (rf *Raft) applyToStateMachine() {
+	for nextCommit := rf.lastApplied + 1; nextCommit <= rf.commitIndex; nextCommit++ {
+		rf.applyCh <- ApplyMsg{
+			CommandValid: true,
+			Command:      rf.log[nextCommit].Command,
+			CommandIndex: nextCommit,
+		}
+	}
+	rf.lastApplied = rf.commitIndex
+}
+
+// *** END ***
 
 // RequestVoteArgs RPC arguments structure.
 // field names must start with capital letters!
@@ -275,16 +324,6 @@ func min(a, b int) int {
 		return a
 	}
 	return b
-}
-
-// adjustFollowerCommit - requires lock to be held by caller
-func (rf *Raft) adjustFollowerCommit(leaderCommit, lastNewIndex int) {
-	if leaderCommit > rf.commitIndex {
-		rf.commitIndex = min(leaderCommit, lastNewIndex)
-		if rf.commitIndex > rf.lastApplied {
-			rf.applyToStateMachine()
-		}
-	}
 }
 
 // AppendEntries is an RPC handler.
@@ -408,28 +447,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	}
 }
 
-// adjustLeaderCommit - caller needs to hold lock
-func (rf *Raft) adjustLeaderCommit() {
-	// Find max N such that majority of matchIndex[i] >= N and log[N].term == currentTerm
-	// We can rely on the fact that log[0].term = 0 to stop our loop (dummy LogEntry)
-	for i := rf.lastLogIndex(); rf.log[i].Term == rf.currentTerm; i-- {
-		nSatisfied := 0
-		for j := range rf.matchIndex {
-			if rf.matchIndex[j] >= i {
-				nSatisfied++
-			}
-		}
-		if nSatisfied > len(rf.peers)/2 {
-			// Majority consensus achieved for log @ commit index
-			rf.commitIndex = i
-			if rf.commitIndex > rf.lastApplied {
-				rf.applyToStateMachine()
-			}
-			break
-		}
-	}
-}
-
 // shouldRetryAppendEntries - adjusts state given reply and determines whether to retry the AE
 func (rf *Raft) shouldRetryAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	rf.mu.Lock()
@@ -524,19 +541,6 @@ func (rf *Raft) promoteToLeader() {
 	// TODO: goroutine for now to prevent deadlock but better pattern?
 	go rf.broadcastLogUpdates()
 	log.Printf("Server %v is now the leader in term %v.\n", rf.me, rf.currentTerm)
-}
-
-// applyToStateMachine - ensures that any committed log command is only applied once via mutex guarding.
-// *** requires lock to be held by caller
-func (rf *Raft) applyToStateMachine() {
-	for nextCommit := rf.lastApplied + 1; nextCommit <= rf.commitIndex; nextCommit++ {
-		rf.applyCh <- ApplyMsg{
-			CommandValid: true,
-			Command:      rf.log[nextCommit].Command,
-			CommandIndex: nextCommit,
-		}
-	}
-	rf.lastApplied = rf.commitIndex
 }
 
 // Start - the client API for providing new commands to push to the log and apply
