@@ -61,9 +61,14 @@ type State uint8
 
 const (
 	Follower State = iota
-	Leader
 	Candidate
+	Leader
 )
+
+type LogEntry struct {
+	Term    int
+	Command interface{}
+}
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -72,32 +77,40 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	applyCh   chan ApplyMsg
 
-	// Your data here (2A, 2B, 2C).
+	// Your data here (2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
 	// The following are (thread-safe) channels used for event notifications
 	validHeartbeatCh       chan Notification
-	validRequestVoteCh     chan Notification
+	voteGrantedCh          chan Notification
 	majorityAchievedCh     chan Notification
 	demotionNotificationCh chan Notification
+	logsBroadcastedCh      chan Notification
 	killCh                 chan Notification
 
 	// The following need to be locked by a mutex
+	// Election
 	currentTerm int
 	state       State
 	votedFor    int
 	nVotes      int
+
+	// Replication
+	commitIndex int
+	lastApplied int
+	log         []LogEntry
+	nextIndex   []int
+	matchIndex  []int
 }
 
-// return currentTerm and whether this server
-// believes it is the leader.
+// GetState - server's belief of the current term and its leader status
 func (rf *Raft) GetState() (int, bool) {
 
 	var term int
 	var isleader bool
-	// Your code here (2A).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -158,91 +171,19 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-	Term      int
-	Candidate int
-}
-
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-type RequestVoteReply struct {
-	// Your data here (2A).
-	Term        int
-	VoteGranted bool
-}
-
-type AppendEntriesArgs struct {
-	Term   int
-	Leader int
-}
-
-type AppendEntriesReply struct {
-	Term    int
-	Success bool
-}
-
-// example RequestVote RPC handler.
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if args.Term < rf.currentTerm {
-		// Candidate is outdated, ignore and get them to update
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = false
-	} else if args.Term == rf.currentTerm {
-		// Already voted in this term
-		reply.Term = args.Term
-		reply.VoteGranted = rf.votedFor == args.Candidate
-	} else {
-		// T > currentTerm -> vote for candidate, become a follower
-		reply.Term = args.Term
-		reply.VoteGranted = true
-		rf.demoteToFollower(args.Term)
-		rf.votedFor = args.Candidate
-		// Reset election timer since vote has been granted
-		notifyEvent(rf.validRequestVoteCh, fmt.Sprintf("(RequestVote, %v)", rf.me))
-	}
-}
-
-// AppendEntries is an RPC handler.
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	// For part 2a, just treat as heartbeat
-	if args.Term < rf.currentTerm {
-		// Candidate is outdated, ignore and get them to update
-		reply.Term = rf.currentTerm
-		reply.Success = false
-		return
-	}
-	// T >= currentTerm -> this message is from the presumed leader
-	reply.Term = args.Term
-	reply.Success = true
-	if args.Term > rf.currentTerm || rf.state != Follower {
-		// 1) if T > currentTerm, we need to explicitly update our currentTerm
-		// 2) if T == currentTerm but state != Follower, we need to demote since this request is from the new leader.
-		rf.demoteToFollower(args.Term)
-	}
-	notifyEvent(rf.validHeartbeatCh, fmt.Sprintf("(ValidHeartbeat, %v)", rf.me))
-}
-
-// notifyEvent sends an event notification to a bool channel if any thread is waiting on that notification.
+// notifyEvent sends an event notification to a channel if any thread is waiting on that notification.
 func notifyEvent(eventCh chan Notification, eventType string) {
 	// From: https://stackoverflow.com/questions/25657207/how-to-know-a-buffered-channel-is-full
 	select {
 	case eventCh <- Notification{}:
 		log.Printf("Notified a %v event!\n", eventType)
 	default:
-		// Do nothing; nothing was waiting on an event
+		// Do nothing; ticker() is NOT waiting on this event
 	}
 }
 
+// demoteToFollower - requires caller to have lock held
 func (rf *Raft) demoteToFollower(updatedTerm int) {
-	// IMPORTANT: This method requires that the calling method has the lock.
 	// General premise is that this Raft server is out of date.
 	// Invariant - caller verified that updatedTerm > rf.currentTerm or (updatedTerm == rf.currentTerm and state != F)
 	// Within AE and RV responses and RV handler, updatedTerm > rf.currentTerm guaranteed
@@ -256,11 +197,164 @@ func (rf *Raft) demoteToFollower(updatedTerm int) {
 	notifyEvent(rf.demotionNotificationCh, fmt.Sprintf("(DemotionToFollower, %v)", rf.me))
 }
 
+// lastLogTerm - assumes lock is held by caller
+func (rf *Raft) lastLogTerm() int {
+	return rf.log[rf.lastLogIndex()].Term
+}
+
+// lastLogIndex - assumes lock is held by caller
+func (rf *Raft) lastLogIndex() int {
+	return len(rf.log) - 1
+}
+
+// RequestVoteArgs RPC arguments structure.
+// field names must start with capital letters!
+type RequestVoteArgs struct {
+	Term         int
+	Candidate    int
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+// RequestVoteReply RPC reply structure.
+// field names must start with capital letters!
+type RequestVoteReply struct {
+	Term        int
+	VoteGranted bool
+}
+
+// RequestVote RPC handler.
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm {
+		// Candidate is outdated, ignore and get them to update
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+	} else if args.Term == rf.currentTerm {
+		// If this server is already on this term, it got here one of two ways:
+		// 1) it voted for a candidate already in the current election (in which case its votedFor = someCandidate)
+		// 2) it got an AppendEntries from a leader whose term was this (in which case its votedFor = -1)
+		// In either case, we don't want to explicitly demote and only grant vote if we voted for candidate already.
+		// We also DO NOT want to reset the election timer since a vote has already been cast.
+		reply.Term = args.Term
+		reply.VoteGranted = rf.votedFor == args.Candidate
+	} else {
+		// T > currentTerm -> Become a follower
+		rf.demoteToFollower(args.Term)
+		reply.Term = args.Term
+		reply.VoteGranted = false
+		// Vote for candidate IF up-to-date condition passes:
+		// 1) candidate last log entry term is later than this server OR
+		// 2) same last log term and candidate has same or greater length log
+		if args.LastLogTerm > rf.lastLogTerm() || (args.LastLogTerm == rf.lastLogTerm() && args.LastLogIndex >= rf.lastLogIndex()) {
+			reply.VoteGranted = true
+			rf.votedFor = args.Candidate
+			// Reset election timer since vote has been granted
+			notifyEvent(rf.voteGrantedCh, fmt.Sprintf("(RequestVote, %v)", rf.me))
+		}
+	}
+}
+
+type AppendEntriesArgs struct {
+	Term         int
+	Leader       int
+	LeaderCommit int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func min(a, b int) int {
+	if a <= b {
+		return a
+	}
+	return b
+}
+
+// adjustFollowerCommit - requires lock to be held by caller
+func (rf *Raft) adjustFollowerCommit(leaderCommit, lastNewIndex int) {
+	if leaderCommit > rf.commitIndex {
+		rf.commitIndex = min(leaderCommit, lastNewIndex)
+		if rf.commitIndex > rf.lastApplied {
+			rf.applyToStateMachine()
+		}
+	}
+}
+
+// AppendEntries is an RPC handler.
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term < rf.currentTerm {
+		// "Leader" is outdated, ignore and get them to update / demote
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+
+	// T >= currentTerm -> this message is from the presumed leader and thus a valid "heartbeat" to reset timer
+	notifyEvent(rf.validHeartbeatCh, fmt.Sprintf("(ValidHeartbeat, %v)", rf.me))
+
+	if args.Term > rf.currentTerm || rf.state != Follower {
+		// 1) if T > currentTerm, we need to explicitly update our currentTerm
+		// 2) if T == currentTerm but state != Follower, we need to demote since this request is from the new leader.
+		rf.demoteToFollower(args.Term)
+	}
+
+	reply.Term = args.Term
+	// Checkpoint #2: Log Consistency check
+	if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// Inconsistent -> triggers retry from leader
+		reply.Success = false
+		return
+	}
+
+	reply.Success = true
+
+	// Starting at prevLogIndex + 1 (one after the last guaranteed match), we check for the first mismatching index.
+	startIndex := args.PrevLogIndex + 1
+	i := 0
+	for startIndex+i <= rf.lastLogIndex() && i < len(args.Entries) {
+		if rf.log[startIndex+i].Term != args.Entries[i].Term {
+			break
+		}
+		i++
+	}
+
+	if i == len(args.Entries) {
+		// No new entries -> return success but DO NOT adjust/truncate log
+		// We will need a modified version of Checkpoint #5 with the last new log == startIndex + i - 1.
+		rf.adjustFollowerCommit(args.LeaderCommit, startIndex+i-1)
+		return
+	}
+
+	// We have new entries and potentially mismatches starting at rf.log[startIndex+i]
+	// 1) delete rf.log[startIndex+i:] (if in-bounds)
+	// 2) append Entries[i:] to end of rf.log
+	if startIndex+i <= rf.lastLogIndex() {
+		// Checkpoint #3 in AE handler: Delete all mismatches; ie, rf.log[startIndex+i:]
+		rf.log = rf.log[:startIndex+i]
+	}
+	// Checkpoint #4 in AE handler: Append new entries from the mismatch point.
+	rf.log = append(rf.log, args.Entries[i:]...)
+
+	// Checkpoint #5 in AE Handler: Adjust commitIndex with the last log as the newest
+	rf.adjustFollowerCommit(args.LeaderCommit, rf.lastLogIndex())
+
+}
+
 func (rf *Raft) startNewElection() {
-	// Based on figure 2, move state to Candidate
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// We are called synchronously from ticker() if Follower or Candidate hit election timeout
+	// Based on figure 2, move state to Candidate, vote for self, adjust term
 	rf.state = Candidate
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
@@ -268,8 +362,10 @@ func (rf *Raft) startNewElection() {
 	log.Printf("Server %v starting an election in term %v!\n", rf.me, rf.currentTerm)
 	// Send Request Votes
 	args := RequestVoteArgs{
-		Term:      rf.currentTerm,
-		Candidate: rf.me,
+		Term:         rf.currentTerm,
+		Candidate:    rf.me,
+		LastLogIndex: rf.lastLogIndex(),
+		LastLogTerm:  rf.lastLogTerm(),
 	}
 	for i := range rf.peers {
 		if i != rf.me {
@@ -279,55 +375,12 @@ func (rf *Raft) startNewElection() {
 	}
 }
 
-func (rf *Raft) sendHeartbeats() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if rf.state != Leader {
-		return
-	}
-	args := AppendEntriesArgs{
-		Term:   rf.currentTerm,
-		Leader: rf.me,
-	}
-	for i := range rf.peers {
-		if i != rf.me {
-			reply := AppendEntriesReply{}
-			go rf.sendAppendEntries(i, &args, &reply)
-		}
-	}
-}
-
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
+// sendRequestVote - called by candidate to garner votes from peers.  Generally will be called
+// in goroutine since labrpc's simulated network can have delays or losses, which we do not want to
+// block any unrelated function.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	if !ok {
-		// TODO: Should we re-send this request to vote?
 		return
 	}
 
@@ -349,48 +402,167 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 	if rf.nVotes > len(rf.peers)/2 {
 		// Majority achieved
-		rf.state = Leader
+		// Note: we can hit this block multiple times for a (leader, term) since it may get an
+		// overwhelming majority of votes.  As such, we must take care to swap state variables only once.
 		notifyEvent(rf.majorityAchievedCh, fmt.Sprintf("(MajorityAchieved, %v)", rf.me))
-		log.Printf("Server %v is now the leader in term %v.\n", rf.me, rf.currentTerm)
 	}
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	if !ok {
-		// TODO: Should we re-send this heartbeat?
-		return
+// adjustLeaderCommit - caller needs to hold lock
+func (rf *Raft) adjustLeaderCommit() {
+	// Find max N such that majority of matchIndex[i] >= N and log[N].term == currentTerm
+	// We can rely on the fact that log[0].term = 0 to stop our loop (dummy LogEntry)
+	for i := rf.lastLogIndex(); rf.log[i].Term == rf.currentTerm; i-- {
+		nSatisfied := 0
+		for j := range rf.matchIndex {
+			if rf.matchIndex[j] >= i {
+				nSatisfied++
+			}
+		}
+		if nSatisfied > len(rf.peers)/2 {
+			// Majority consensus achieved for log @ commit index
+			rf.commitIndex = i
+			if rf.commitIndex > rf.lastApplied {
+				rf.applyToStateMachine()
+			}
+			break
+		}
 	}
+}
 
+// shouldRetryAppendEntries - adjusts state given reply and determines whether to retry the AE
+func (rf *Raft) shouldRetryAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if reply.Term > rf.currentTerm {
-		// Convert to follower
+		// Failed because we are out of date -> convert to follower
 		rf.demoteToFollower(reply.Term)
-		return
+		return false
+	}
+
+	// If we were demoted elsewhere, stop sending AEs
+	if rf.state != Leader {
+		return false
+	}
+
+	if reply.Success {
+		// We are leader and got success from follower -> we can adjust nextIndex and matchIndex
+		rf.nextIndex[server] = rf.lastLogIndex() + 1
+		rf.matchIndex[server] = rf.lastLogIndex()
+		rf.adjustLeaderCommit()
+		return false
+	}
+
+	// We did not succeed because of Log Matching condition -> decrement nextIndex, modify args, and retry
+	rf.nextIndex[server] -= 1
+	prevLogIndex := rf.nextIndex[server] - 1
+	// LeaderID and Term should be left unchanged.
+	args.PrevLogIndex = prevLogIndex
+	args.PrevLogTerm = rf.log[prevLogIndex].Term
+	args.Entries = rf.log[rf.nextIndex[server]:]
+	// Commit idx could have changed since we last populated this RPC args struct.
+	args.LeaderCommit = rf.commitIndex
+	return true
+
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs) {
+	for {
+		reply := &AppendEntriesReply{}
+		ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+		if !ok {
+			return
+		}
+		// Check if we should retry and adjust args and state accordingly
+		if !rf.shouldRetryAppendEntries(server, args, reply) {
+			break
+		}
 	}
 }
 
-// the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
-// server isn't the leader, returns false. otherwise start the
-// agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
-// may fail or lose an election. even if the Raft instance has been killed,
-// this function should return gracefully.
-//
-// the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
-// the leader.
+// broadcastLogUpdates is called when this Raft server thinks it is leader.
+func (rf *Raft) broadcastLogUpdates() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// Should not be sending AEs if we have been demoted
+	if rf.state != Leader {
+		return
+	}
+	for i := range rf.peers {
+		if i != rf.me {
+			prevLogIndex := rf.nextIndex[i] - 1
+			args := AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				Leader:       rf.me,
+				LeaderCommit: rf.commitIndex,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  rf.log[prevLogIndex].Term,
+				Entries:      rf.log[rf.nextIndex[i]:],
+			}
+			go rf.sendAppendEntries(i, &args)
+		}
+	}
+}
+
+// promoteToLeader - performs state changes to Leader state
+func (rf *Raft) promoteToLeader() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// When ticker() calls promoteToLeader, we are the Leader; however,
+	// an RPC handler can demote us to Follower before we can grab the lock here.
+	if rf.state == Follower {
+		return
+	}
+	rf.state = Leader
+	for i := range rf.peers {
+		rf.nextIndex[i] = rf.lastLogIndex() + 1
+		rf.matchIndex[i] = 0
+	}
+	rf.matchIndex[rf.me] = rf.lastLogIndex() // We fully match our own log
+	// TODO: goroutine for now to prevent deadlock but better pattern?
+	go rf.broadcastLogUpdates()
+	log.Printf("Server %v is now the leader in term %v.\n", rf.me, rf.currentTerm)
+}
+
+// applyToStateMachine - ensures that any committed log command is only applied once via mutex guarding.
+// *** requires lock to be held by caller
+func (rf *Raft) applyToStateMachine() {
+	for nextCommit := rf.lastApplied + 1; nextCommit <= rf.commitIndex; nextCommit++ {
+		rf.applyCh <- ApplyMsg{
+			CommandValid: true,
+			Command:      rf.log[nextCommit].Command,
+			CommandIndex: nextCommit,
+		}
+	}
+	rf.lastApplied = rf.commitIndex
+}
+
+// Start - the client API for providing new commands to push to the log and apply
+// to the state machine.  Only the leader should do anything with this.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
-	term := -1
-	isLeader := true
 
-	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	return index, term, isLeader
+	if rf.state != Leader {
+		return index, rf.currentTerm, false
+	}
+
+	rf.log = append(rf.log, LogEntry{
+		Term:    rf.currentTerm,
+		Command: command,
+	})
+
+	rf.matchIndex[rf.me] = rf.lastLogIndex() // We always match our own last log index
+
+	// Send log updates via AEs to all peers
+	go rf.broadcastLogUpdates()
+	notifyEvent(rf.logsBroadcastedCh, fmt.Sprintf("(LogsBroadcasted, %v)", rf.me))
+
+	return rf.lastLogIndex(), rf.lastLogTerm(), true
 }
 
 // Kill "kills" this server from perspective of labrpc framework.
@@ -429,7 +601,7 @@ func (rf *Raft) ticker() {
 				rf.startNewElection()
 			case <-rf.validHeartbeatCh:
 				// reset timeout; ie, do nothing
-			case <-rf.validRequestVoteCh:
+			case <-rf.voteGrantedCh:
 				// reset timeout; ie, do nothing
 			case <-rf.killCh:
 				// do nothing, outer for loop will now exit
@@ -442,8 +614,8 @@ func (rf *Raft) ticker() {
 				// Start another election
 				rf.startNewElection()
 			case <-rf.majorityAchievedCh:
-				// Send heartbeats immediately here
-				rf.sendHeartbeats()
+				// Transition to leader and broadcast heartbeats
+				rf.promoteToLeader()
 			case <-rf.demotionNotificationCh:
 				// do nothing, re-enter loop with new follower state
 			case <-rf.killCh:
@@ -454,7 +626,9 @@ func (rf *Raft) ticker() {
 			select {
 			case <-time.After(110 * time.Millisecond):
 				// Max 10 heartbeats per second (enforced by tester)
-				rf.sendHeartbeats()
+				rf.broadcastLogUpdates()
+			case <-rf.logsBroadcastedCh:
+				// do nothing, this is to prevent excessive heartbeats by resetting the heartbeat timer
 			case <-rf.demotionNotificationCh:
 				// do nothing, re-enter loop with new follower state
 			case <-rf.killCh:
@@ -479,19 +653,26 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
-	// Your initialization code here (2A, 2B, 2C).
+	// Your initialization code here (2C).
 	// Mutex protected members
 	rf.state = Follower
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.nVotes = 0
+	rf.log = append(rf.log, LogEntry{}) // Fills in with term = 0, cmd = nil for dummy index 0
+	rf.commitIndex = -1
+	rf.lastApplied = 0 // Ensure that dummy LogEntry does not get applied
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
 
 	// Notification channels
 	rf.validHeartbeatCh = make(chan Notification)
-	rf.validRequestVoteCh = make(chan Notification)
+	rf.voteGrantedCh = make(chan Notification)
 	rf.demotionNotificationCh = make(chan Notification)
 	rf.majorityAchievedCh = make(chan Notification)
+	rf.logsBroadcastedCh = make(chan Notification)
 	rf.killCh = make(chan Notification)
 
 	debug := false
