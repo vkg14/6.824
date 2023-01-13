@@ -86,10 +86,6 @@ type Raft struct {
 	dead      int32               // set by Kill()
 	applyCh   chan ApplyMsg
 
-	// Your data here (2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
-
 	// The following are (thread-safe) channels used for event notifications
 	validHeartbeatCh       chan Notification
 	voteGrantedCh          chan Notification
@@ -236,7 +232,7 @@ func (rf *Raft) adjustFollowerCommit(leaderCommit, lastNewIndex int) {
 // adjustLeaderCommit - caller needs to hold lock
 func (rf *Raft) adjustLeaderCommit() {
 	// Find max N such that majority of matchIndex[i] >= N and log[N].term == currentTerm
-	// We can rely on the fact that log[0].term = 0 to stop our loop (dummy LogEntry)
+	// We can rely on the fact that log[0].term = 0 to eventually stop our loop (dummy LogEntry)
 	for i := rf.lastLogIndex(); rf.log[i].Term == rf.currentTerm; i-- {
 		nSatisfied := 0
 		for j := range rf.matchIndex {
@@ -369,16 +365,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = false
 	// Checkpoint #2: Log Consistency check
 	if len(rf.log) <= args.PrevLogIndex {
+		// Tell leader to set nextIndex to end of our log
 		reply.ConflictIndex = len(rf.log)
 		reply.ConflictTerm = math.MaxInt
 		return
 	} else if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// Find first index with term == ConflictTerm -> if leader does not have conflict term in log,
+		// all indices *this index* onwards need to be replaced.
 		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
 		idx := args.PrevLogIndex
 		for rf.log[idx].Term == reply.ConflictTerm {
 			idx--
 		}
-		// First index with term == ConflictTerm
 		reply.ConflictIndex = idx + 1
 		if rf.log[reply.ConflictIndex].Term != reply.ConflictTerm {
 			log.Panicf("Logic to derive conflict indices is wrong.")
@@ -490,7 +488,7 @@ func (rf *Raft) shouldRetryAppendEntries(server int, args *AppendEntriesArgs, re
 		return false
 	}
 
-	// If we were demoted elsewhere or term has passed, or we died, stop retrying
+	// If we were demoted elsewhere, term has passed, or we died, stop retrying
 	if rf.state != Leader || rf.currentTerm > args.Term || rf.killed() {
 		return false
 	}
@@ -509,8 +507,8 @@ func (rf *Raft) shouldRetryAppendEntries(server int, args *AppendEntriesArgs, re
 	// The algorithm below is to find the index after the last instance of conflict term
 	// If conflict term isn't present in this leader's log, then we use conflict index directly.
 	// These heuristics speed up the backtracking of next index to more quickly find a common point
-	// between the leader and follower.  NextIndex *may* overshoot but then we simply end up sending more
-	// entries.
+	// between the leader and follower.  NextIndex *may* overshoot, but then we simply end up sending more
+	// entries in the message - the follower figures out which entries are "new".
 	idx := args.PrevLogIndex
 	for rf.log[idx].Term > reply.ConflictTerm {
 		idx--
@@ -584,7 +582,7 @@ func (rf *Raft) promoteToLeader() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// When ticker() calls promoteToLeader, we are the Leader; however,
+	// When ticker() calls promoteToLeader, we are a Candidate with a majority vote; however,
 	// an RPC handler can demote us to Follower before we can grab the lock here.
 	if rf.state == Follower {
 		return
@@ -595,8 +593,6 @@ func (rf *Raft) promoteToLeader() {
 		rf.matchIndex[i] = 0
 	}
 	rf.matchIndex[rf.me] = rf.lastLogIndex() // We fully match our own log
-	// TODO: goroutine for now to prevent deadlock but better pattern?
-	go rf.broadcastLogUpdates()
 	log.Printf("Server %v is now the leader in term %v.\n", rf.me, rf.currentTerm)
 }
 
@@ -646,8 +642,12 @@ func getElectionTimeout() time.Duration {
 	return time.Duration(rand.Intn(max-min) + min)
 }
 
-// The ticker go routine starts a new election if this peer hasn't received
-// heartsbeats recently.
+// ticker represents the main loop for the server.  It outlines waiting behavior for
+// each possible state of the server.  While waiting on these notifications (triggered by RPC requests and replies),
+// it does not hold the mutex so that all other functionality is unblocked.  Another thread / goroutine will tell
+// ticker of a notification by pushing to the relevant channel IF ticker is awaiting a notification from that channel.
+// Each of the blocked select statements also has a time element (either the election timeout or the idle-time
+// heartbeat) to push forward the state when no other notifications have been received.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		rf.mu.Lock()
@@ -656,7 +656,7 @@ func (rf *Raft) ticker() {
 
 		switch state {
 		case Follower:
-			// Use select to wait on election timeout, heartbeat, granted vote or kill notification
+			// Follower waits on election timeout, heartbeat, granted vote or kill notification
 			electionTimeout := time.After(getElectionTimeout() * time.Millisecond)
 			select {
 			case <-electionTimeout:
@@ -669,7 +669,7 @@ func (rf *Raft) ticker() {
 				// do nothing, outer for loop will now exit
 			}
 		case Candidate:
-			// Use select to wait on election timeout, a vote majority, a demotion, or kill notification
+			// Candidate waits on election timeout, a vote majority, a demotion, or kill notification
 			electionTimeout := time.After(getElectionTimeout() * time.Millisecond)
 			select {
 			case <-electionTimeout:
@@ -678,8 +678,9 @@ func (rf *Raft) ticker() {
 			case <-rf.majorityAchievedCh:
 				// Transition to leader and broadcast heartbeats
 				rf.promoteToLeader()
+				rf.broadcastLogUpdates()
 			case <-rf.demotionNotificationCh:
-				// do nothing, re-enter loop with new follower state
+				// do nothing, another leader has been established, re-enter loop with new follower state
 			case <-rf.killCh:
 				// do nothing, outer for loop will now exit
 			}
@@ -717,7 +718,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.applyCh = applyCh
 
-	// Your initialization code here (2C).
 	// Mutex protected members
 	rf.state = Follower
 	rf.currentTerm = 0
