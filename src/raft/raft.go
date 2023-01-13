@@ -21,15 +21,16 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/rand"
 	"os"
 
-	//	"bytes"
+	"bytes"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -68,6 +69,12 @@ const (
 type LogEntry struct {
 	Term    int
 	Command interface{}
+}
+
+type PersistedState struct {
+	Term     int
+	VotedFor int
+	Log      []LogEntry
 }
 
 // A Go object implementing a single Raft peer.
@@ -122,15 +129,17 @@ func (rf *Raft) GetState() (int, bool) {
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
+// Needs to be called WITH lock
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(PersistedState{
+		Term:     rf.currentTerm,
+		VotedFor: rf.votedFor,
+		Log:      rf.log,
+	})
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -138,19 +147,20 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	// Lock and unlock is likely unnecessary since this is called before ticker()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var state PersistedState
+	if d.Decode(&state) != nil {
+		// error...
+	} else {
+		rf.currentTerm = state.Term
+		rf.votedFor = state.VotedFor
+		rf.log = state.Log
+	}
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -197,6 +207,10 @@ func (rf *Raft) demoteToFollower(updatedTerm int) {
 	rf.nVotes = 0
 	// Send this notification to the main loop, which will refrain from any leader/candidate behavior once received.
 	notifyEvent(rf.demotionNotificationCh, fmt.Sprintf("(DemotionToFollower, %v)", rf.me))
+	// In 3 out of 4 cases -> demotion results in a term change
+	// In 4th case, candidate is demoted to follower by a new leader who is elected in said term
+	// Since a call to demote to follower will likely change term -> persist!
+	rf.persist()
 }
 
 // lastLogIndex - assumes lock is held by caller
@@ -301,6 +315,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = args.Candidate
 			// Reset election timer since vote has been granted
 			notifyEvent(rf.voteGrantedCh, fmt.Sprintf("(RequestVote, %v)", rf.me))
+			// We voted -> persist!
+			rf.persist()
 		}
 	}
 }
@@ -315,8 +331,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 func min(a, b int) int {
@@ -348,10 +366,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	reply.Term = args.Term
+	reply.Success = false
 	// Checkpoint #2: Log Consistency check
-	if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		// Inconsistent -> triggers retry from leader
-		reply.Success = false
+	if len(rf.log) <= args.PrevLogIndex {
+		reply.ConflictIndex = len(rf.log)
+		reply.ConflictTerm = math.MaxInt
+		return
+	} else if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		idx := args.PrevLogIndex
+		for rf.log[idx].Term == reply.ConflictTerm {
+			idx--
+		}
+		// First index with term == ConflictTerm
+		reply.ConflictIndex = idx + 1
+		if rf.log[reply.ConflictIndex].Term != reply.ConflictTerm {
+			log.Panicf("Logic to derive conflict indices is wrong.")
+		}
 		return
 	}
 
@@ -383,10 +414,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// Checkpoint #4 in AE handler: Append new entries from the mismatch point.
 	rf.log = append(rf.log, args.Entries[i:]...)
+	rf.persist() // log successfully changed
 
 	// Checkpoint #5 in AE Handler: Adjust commitIndex with the last log as the newest
 	rf.adjustFollowerCommit(args.LeaderCommit, rf.lastLogIndex())
-
 }
 
 func (rf *Raft) startNewElection() {
@@ -398,6 +429,8 @@ func (rf *Raft) startNewElection() {
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
 	rf.nVotes = 1 // important: vote for self
+	// New election -> term and votedFor modified -> persist!
+	rf.persist()
 	log.Printf("Server %v starting an election in term %v!\n", rf.me, rf.currentTerm)
 	// Send Request Votes
 	args := RequestVoteArgs{
@@ -431,8 +464,8 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		return
 	}
 
-	if rf.currentTerm > args.Term || !reply.VoteGranted {
-		// We are in a later term or the vote is not for us
+	if rf.currentTerm > args.Term || !reply.VoteGranted || rf.killed() {
+		// We are in a later term, the vote is not for us, or we are dead
 		return
 	}
 
@@ -457,22 +490,46 @@ func (rf *Raft) shouldRetryAppendEntries(server int, args *AppendEntriesArgs, re
 		return false
 	}
 
-	// If we were demoted elsewhere or term has passed, stop retrying
-	if rf.state != Leader || rf.currentTerm > args.Term {
+	// If we were demoted elsewhere or term has passed, or we died, stop retrying
+	if rf.state != Leader || rf.currentTerm > args.Term || rf.killed() {
 		return false
 	}
 
 	if reply.Success {
 		// We are leader and got success from follower -> we can adjust nextIndex and matchIndex
-		rf.nextIndex[server] = rf.lastLogIndex() + 1
-		rf.matchIndex[server] = rf.lastLogIndex()
+		// Since rf.log length may have changed, matchIndex should be precisely set according to the new entries.
+		// We can set nextIndex to matchIndex + 1 -> might increase num entries sent in message but reduce total RPCs
+		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+		rf.nextIndex[server] = rf.matchIndex[server] + 1
 		rf.adjustLeaderCommit()
 		return false
 	}
 
-	// We did not succeed because of Log Matching condition -> decrement nextIndex, modify args, and retry
-	rf.nextIndex[server] -= 1
+	// We did not succeed because of Log Matching condition -> push back nextIndex, modify args, and retry
+	// The algorithm below is to find the index after the last instance of conflict term
+	// If conflict term isn't present in this leader's log, then we use conflict index directly.
+	// These heuristics speed up the backtracking of next index to more quickly find a common point
+	// between the leader and follower.  NextIndex *may* overshoot but then we simply end up sending more
+	// entries.
+	idx := args.PrevLogIndex
+	for rf.log[idx].Term > reply.ConflictTerm {
+		idx--
+	}
+	if rf.log[idx].Term == reply.ConflictTerm {
+		rf.nextIndex[server] = idx + 1
+	} else {
+		rf.nextIndex[server] = reply.ConflictIndex
+	}
 	prevLogIndex := rf.nextIndex[server] - 1
+	if prevLogIndex >= args.PrevLogIndex {
+		log.Panicf(
+			"New prevlogidx %v did not decrease from old one %v for leader %v in term %v",
+			prevLogIndex,
+			args.PrevLogIndex,
+			rf.me,
+			rf.currentTerm,
+		)
+	}
 	// LeaderID and Term should be left unchanged.
 	args.PrevLogIndex = prevLogIndex
 	args.PrevLogTerm = rf.log[prevLogIndex].Term
@@ -559,6 +616,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    rf.currentTerm,
 		Command: command,
 	})
+	rf.persist() // Log changes when new command comes in -> persist
 
 	rf.matchIndex[rf.me] = rf.lastLogIndex() // We always match our own last log index
 
