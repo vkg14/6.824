@@ -431,7 +431,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		return
 	}
 
-	if rf.currentTerm > reply.Term || !reply.VoteGranted {
+	if rf.currentTerm > args.Term || !reply.VoteGranted {
 		// We are in a later term or the vote is not for us
 		return
 	}
@@ -457,8 +457,8 @@ func (rf *Raft) shouldRetryAppendEntries(server int, args *AppendEntriesArgs, re
 		return false
 	}
 
-	// If we were demoted elsewhere, stop sending AEs
-	if rf.state != Leader {
+	// If we were demoted elsewhere or term has passed, stop retrying
+	if rf.state != Leader || rf.currentTerm > args.Term {
 		return false
 	}
 
