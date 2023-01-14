@@ -18,19 +18,17 @@ package raft
 //
 
 import (
+	"bytes"
 	"fmt"
-	"io"
 	"log"
 	"math"
 	"math/rand"
-	"os"
-
-	"bytes"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"6.824/labgob"
+	"6.824/lablog"
 	"6.824/labrpc"
 )
 
@@ -162,9 +160,7 @@ func (rf *Raft) readPersist(data []byte) {
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
-	// Your code here (2D).
-
+	// Lab instructs to leave blank.
 	return true
 }
 
@@ -178,11 +174,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 }
 
 // notifyEvent sends an event notification to a channel if any thread is waiting on that notification.
-func notifyEvent(eventCh chan Notification, eventType string) {
+func notifyEvent(eventCh chan Notification, eventType string, server int) {
 	// From: https://stackoverflow.com/questions/25657207/how-to-know-a-buffered-channel-is-full
 	select {
 	case eventCh <- Notification{}:
-		log.Printf("Notified a %v event!\n", eventType)
+		lablog.Debug(server, lablog.Info, "Pushed a %v event!", eventType)
 	default:
 		// Do nothing; ticker() is NOT waiting on this event
 	}
@@ -202,7 +198,7 @@ func (rf *Raft) demoteToFollower(updatedTerm int) {
 	rf.votedFor = -1
 	rf.nVotes = 0
 	// Send this notification to the main loop, which will refrain from any leader/candidate behavior once received.
-	notifyEvent(rf.demotionNotificationCh, fmt.Sprintf("(DemotionToFollower, %v)", rf.me))
+	notifyEvent(rf.demotionNotificationCh, fmt.Sprintf("(DemotionToFollower, %v)", rf.me), rf.me)
 	// In 3 out of 4 cases -> demotion results in a term change
 	// In 4th case, candidate is demoted to follower by a new leader who is elected in said term
 	// Since a call to demote to follower will likely change term -> persist!
@@ -310,7 +306,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 			rf.votedFor = args.Candidate
 			// Reset election timer since vote has been granted
-			notifyEvent(rf.voteGrantedCh, fmt.Sprintf("(RequestVote, %v)", rf.me))
+			notifyEvent(rf.voteGrantedCh, fmt.Sprintf("(RequestVote, %v)", rf.me), rf.me)
 			// We voted -> persist!
 			rf.persist()
 		}
@@ -353,7 +349,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// T >= currentTerm -> this message is from the presumed leader and thus a valid "heartbeat" to reset timer
-	notifyEvent(rf.validHeartbeatCh, fmt.Sprintf("(ValidHeartbeat, %v)", rf.me))
+	notifyEvent(rf.validHeartbeatCh, fmt.Sprintf("(ValidHeartbeat, %v)", rf.me), rf.me)
 
 	if args.Term > rf.currentTerm || rf.state != Follower {
 		// 1) if T > currentTerm, we need to explicitly update our currentTerm
@@ -429,7 +425,7 @@ func (rf *Raft) startNewElection() {
 	rf.nVotes = 1 // important: vote for self
 	// New election -> term and votedFor modified -> persist!
 	rf.persist()
-	log.Printf("Server %v starting an election in term %v!\n", rf.me, rf.currentTerm)
+	lablog.Debug(rf.me, lablog.Election, "Server %d started an election in term %d", rf.me, rf.currentTerm)
 	// Send Request Votes
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
@@ -474,7 +470,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		// Majority achieved
 		// Note: we can hit this block multiple times for a (leader, term) since it may get an
 		// overwhelming majority of votes.  As such, we must take care to swap state variables only once.
-		notifyEvent(rf.majorityAchievedCh, fmt.Sprintf("(MajorityAchieved, %v)", rf.me))
+		notifyEvent(rf.majorityAchievedCh, fmt.Sprintf("(MajorityAchieved, %v)", rf.me), rf.me)
 	}
 }
 
@@ -504,6 +500,10 @@ func (rf *Raft) shouldRetryAppendEntries(server int, args *AppendEntriesArgs, re
 	}
 
 	// We did not succeed because of Log Matching condition -> push back nextIndex, modify args, and retry
+	if args.PrevLogIndex < rf.nextIndex[server]-1 {
+		// We have since advanced nextIndex so we can ignore this
+		return false
+	}
 	// The algorithm below is to find the index after the last instance of conflict term
 	// If conflict term isn't present in this leader's log, then we use conflict index directly.
 	// These heuristics speed up the backtracking of next index to more quickly find a common point
@@ -593,7 +593,7 @@ func (rf *Raft) promoteToLeader() {
 		rf.matchIndex[i] = 0
 	}
 	rf.matchIndex[rf.me] = rf.lastLogIndex() // We fully match our own log
-	log.Printf("Server %v is now the leader in term %v.\n", rf.me, rf.currentTerm)
+	lablog.Debug(rf.me, lablog.Leader, "Server %d is now leader in term %d", rf.me, rf.currentTerm)
 }
 
 // Start - the client API for providing new commands to push to the log and apply
@@ -615,10 +615,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.persist() // Log changes when new command comes in -> persist
 
 	rf.matchIndex[rf.me] = rf.lastLogIndex() // We always match our own last log index
+	lablog.Debug(
+		rf.me,
+		lablog.Log2,
+		"Received log: %v, with NI:%v, MI:%v",
+		rf.log[rf.lastLogIndex()],
+		rf.nextIndex,
+		rf.matchIndex,
+	)
 
 	// Send log updates via AEs to all peers
 	go rf.broadcastLogUpdates()
-	notifyEvent(rf.logsBroadcastedCh, fmt.Sprintf("(LogsBroadcasted, %v)", rf.me))
+	notifyEvent(rf.logsBroadcastedCh, fmt.Sprintf("(LogsBroadcasted, %v)", rf.me), rf.me)
 
 	return rf.lastLogIndex(), rf.lastLogTerm(), true
 }
@@ -627,7 +635,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // We notify the main loop (ticker) of the kill so it can exit.
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
-	notifyEvent(rf.killCh, fmt.Sprintf("(Kill, %v)", rf.me))
+	notifyEvent(rf.killCh, fmt.Sprintf("(Kill, %v)", rf.me), rf.me)
 }
 
 func (rf *Raft) killed() bool {
@@ -736,13 +744,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.majorityAchievedCh = make(chan Notification)
 	rf.logsBroadcastedCh = make(chan Notification)
 	rf.killCh = make(chan Notification)
-
-	debug := false
-	if !debug {
-		log.SetOutput(io.Discard)
-	} else {
-		log.SetOutput(os.Stdout) // To debug
-	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
